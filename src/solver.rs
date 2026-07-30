@@ -1,19 +1,16 @@
-//! 2D incompressible Euler solver (vorticity-streamfunction form).
+//! 2D incompressible vorticity-transport solver (vorticity-streamfunction form).
 //!
-//! Governing equations (inviscid, incompressible):
-//!     dω/dt + (u·∇)ω = ν ∇²ω          (ν → 0 is the Euler limit)
-//!     ∇²ψ = -ω
-//!     u =  ∂ψ/∂y,   v = -∂ψ/∂x
+//!     dω/dt + (u·∇)ω = ν ∇²ω ,   ∇²ψ = -ω ,   u = ∂ψ/∂y ,  v = -∂ψ/∂x
 //!
-//! Discretisation:
-//!   * Advection  : Arakawa Jacobian (conserves energy & enstrophy) -> stable
-//!                  for the inviscid nonlinear term without upwind dissipation.
-//!   * Diffusion  : standard 5-point Laplacian (ν kept small, high Reynolds
-//!                  number, so the interior flow is effectively Euler).
-//!   * Time       : SSP-RK3 (strong-stability-preserving Runge-Kutta).
-//!   * Poisson    : FFT/DST direct solve, or red-black SOR (see `poisson`).
-//!   * Wall BC    : ψ = 0 (no penetration) + Thom's formula for wall vorticity
-//!                  (the top lid injects vorticity through this BC).
+//! Advection: Arakawa Jacobian (energy/enstrophy conserving). Time: SSP-RK3.
+//! Poisson: FFT/DST (cavity) or red-black SOR. Two scenarios:
+//!
+//!   * `cavity`   — square lid-driven cavity, ψ = 0 on all walls, Thom wall
+//!                  vorticity, top lid moving. High-Re "Euler limit".
+//!   * `cylinder` — channel with an immersed circular cylinder: uniform inflow,
+//!                  Neumann outflow, free-slip channel walls, no-slip cylinder
+//!                  (staircase mask + Thom). Moderate Re_D → Kármán vortex street
+//!                  (a viscous, Navier-Stokes phenomenon).
 
 use rayon::prelude::*;
 use std::fs::File;
@@ -22,202 +19,307 @@ use std::io::{BufWriter, Write};
 use crate::config::Config;
 use crate::poisson::PoissonFft;
 
-/// Raw-pointer wrapper that is `Send + Sync` so the red-black SOR sweep can
-/// write disjoint cells of `psi` from several threads at once. The red-black
-/// ordering guarantees that within one colour sweep every thread writes only
-/// same-colour cells and reads only opposite-colour neighbours (which are not
-/// written during that sweep), so there is no data race.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Scenario {
+    Cavity,
+    Cylinder,
+}
+
 #[derive(Copy, Clone)]
 struct SendPtr(*mut f64);
 unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
 
 #[inline(always)]
-fn idx(i: usize, j: usize, n: usize) -> usize {
-    j * n + i
+fn idx(i: usize, j: usize, nx: usize) -> usize {
+    j * nx + i
 }
 
 pub struct Solver {
     pub cfg: Config,
-    pub n: usize,
+    pub scenario: Scenario,
+    pub nx: usize,
+    pub ny: usize,
+    pub lx: f64,
+    pub ly: f64,
     pub h: f64,
     pub nu: f64,
-    omega: Vec<f64>, // vorticity
-    psi: Vec<f64>,   // streamfunction
-    sor: f64,        // SOR relaxation factor
-    min_len: usize,  // min rows per rayon task (caps task count ~= #threads)
-    fft_poisson: Option<PoissonFft>, // direct solver; None -> iterative SOR
+    u_in: f64, // driving speed (lid / inflow)
+    omega: Vec<f64>,
+    psi: Vec<f64>,
+    solid: Vec<bool>,     // immersed obstacle mask (all false for cavity)
+    psi_fixed: Vec<bool>, // Dirichlet ψ (walls / inflow / solid)
+    psi_val: Vec<f64>,    // fixed ψ values where psi_fixed
+    outflow: bool,        // right column is Neumann outflow
+    sor: f64,
+    min_len: usize,
+    fft_poisson: Option<PoissonFft>,
 }
 
 impl Solver {
     pub fn new(cfg: Config) -> Self {
-        let n = cfg.n;
-        let h = cfg.l / (n as f64 - 1.0);
-        let nu = cfg.u_lid * cfg.l / cfg.re;
-        // Optimal SOR factor for the model Poisson problem on an n x n grid.
-        let sor = 2.0 / (1.0 + (std::f64::consts::PI / (n as f64)).sin());
-        // Split the interior rows into ~#threads contiguous bands so each rayon
-        // sweep dispatches only a handful of tasks (fine-grained splitting would
-        // cost more in fork/join than the arithmetic saves at small grids).
+        let scenario = match cfg.scenario.as_str() {
+            "cylinder" => Scenario::Cylinder,
+            _ => Scenario::Cavity,
+        };
+        match scenario {
+            Scenario::Cavity => Self::new_cavity(cfg),
+            Scenario::Cylinder => Self::new_cylinder(cfg),
+        }
+    }
+
+    fn common(cfg: Config, scenario: Scenario, nx: usize, ny: usize, lx: f64, ly: f64,
+              h: f64, nu: f64, u_in: f64) -> Solver {
+        // Optimal SOR factor for a rectangular grid: ω = 2/(1+√(1−ρ²)) with the
+        // Jacobi spectral radius ρ = ½(cos π/(nx−1) + cos π/(ny−1)). The square
+        // approximation over-relaxes badly on an elongated (channel) domain.
+        let pi = std::f64::consts::PI;
+        let rho = 0.5 * ((pi / (nx as f64 - 1.0)).cos() + (pi / (ny as f64 - 1.0)).cos());
+        let sor = 2.0 / (1.0 + (1.0 - rho * rho).sqrt());
         let nthreads = rayon::current_num_threads().max(1);
-        let min_len = ((n - 2) / nthreads).max(1);
-        // Choose the Poisson solver. The FFT/DST direct solver needs n-1 to be a
-        // power of two; "auto" uses it when possible and falls back to SOR.
+        let min_len = (ny / nthreads).max(1);
+        Solver {
+            cfg,
+            scenario,
+            nx,
+            ny,
+            lx,
+            ly,
+            h,
+            nu,
+            u_in,
+            omega: vec![0.0; nx * ny],
+            psi: vec![0.0; nx * ny],
+            solid: vec![false; nx * ny],
+            psi_fixed: vec![false; nx * ny],
+            psi_val: vec![0.0; nx * ny],
+            outflow: false,
+            sor,
+            min_len,
+            fft_poisson: None,
+        }
+    }
+
+    fn new_cavity(cfg: Config) -> Solver {
+        let n = cfg.n;
+        let l = cfg.l;
+        let h = l / (n as f64 - 1.0);
+        let nu = cfg.u_lid * l / cfg.re;
+        let u_in = cfg.u_lid;
+        let mut s = Self::common(cfg.clone(), Scenario::Cavity, n, n, l, l, h, nu, u_in);
+        // ψ = 0 on all four walls (Dirichlet).
+        for i in 0..n {
+            s.psi_fixed[idx(i, 0, n)] = true;
+            s.psi_fixed[idx(i, n - 1, n)] = true;
+            s.psi_fixed[idx(0, i, n)] = true;
+            s.psi_fixed[idx(n - 1, i, n)] = true;
+        }
+        // Direct FFT/DST solver when possible (square, homogeneous Dirichlet).
         let power2 = (n - 1).is_power_of_two();
         let use_fft = match cfg.solver.as_str() {
             "sor" => false,
             "fft" => {
-                assert!(
-                    power2,
-                    "--solver fft requires n-1 to be a power of two (n = 2^k + 1); got n = {n}"
-                );
+                assert!(power2, "--solver fft requires n = 2^k+1; got n = {n}");
                 true
             }
-            _ => power2, // "auto"
+            _ => power2,
         };
-        let fft_poisson = if use_fft {
-            Some(PoissonFft::new(n, h))
+        if use_fft {
+            s.fft_poisson = Some(PoissonFft::new(n, h));
+        }
+        s
+    }
+
+    fn new_cylinder(cfg: Config) -> Solver {
+        // Channel of height ly=cfg.l, length lx = aspect·ly.
+        let ny = cfg.n;
+        let ly = cfg.l;
+        let h = ly / (ny as f64 - 1.0);
+        let aspect = 4.0;
+        let nx = ((aspect * (ny as f64 - 1.0)).round() as usize) + 1;
+        let lx = (nx as f64 - 1.0) * h;
+        let u_in = cfg.u_lid;
+        let d = 0.2 * ly; // cylinder diameter
+        let nu = u_in * d / cfg.re; // Re based on diameter
+        let mut s = Self::common(cfg.clone(), Scenario::Cylinder, nx, ny, lx, ly, h, nu, u_in);
+        s.outflow = true;
+
+        let r = 0.5 * d;
+        let xc = 1.0 * ly; // ~5 diameters downstream of the inlet
+        let yc = 0.5 * ly + 0.5 * h; // half-cell offset breaks the symmetry
+        let psi_cyl = u_in * 0.5 * ly; // centreline streamfunction value
+
+        for j in 0..ny {
+            let y = j as f64 * h;
+            for i in 0..nx {
+                let x = i as f64 * h;
+                let c = idx(i, j, nx);
+                // immersed solid cylinder
+                if (x - xc) * (x - xc) + (y - yc) * (y - yc) <= r * r {
+                    s.solid[c] = true;
+                    s.psi_fixed[c] = true;
+                    s.psi_val[c] = psi_cyl;
+                }
+                // inflow (left): uniform u = U -> ψ = U·y
+                if i == 0 {
+                    s.psi_fixed[c] = true;
+                    s.psi_val[c] = u_in * y;
+                }
+                // channel walls (bottom ψ=0, top ψ=U·ly) — streamlines (free-slip)
+                if j == 0 {
+                    s.psi_fixed[c] = true;
+                    s.psi_val[c] = 0.0;
+                }
+                if j == ny - 1 {
+                    s.psi_fixed[c] = true;
+                    s.psi_val[c] = u_in * ly;
+                }
+                // right column is Neumann outflow — left free (handled in SOR)
+            }
+        }
+
+        // Seed a small antisymmetric perturbation in the near wake to trigger
+        // shedding sooner (it would eventually grow from round-off anyway).
+        let amp = 3.0;
+        for j in 1..ny - 1 {
+            let y = j as f64 * h;
+            for i in 1..nx - 1 {
+                let x = i as f64 * h;
+                let c = idx(i, j, nx);
+                if s.solid[c] {
+                    continue;
+                }
+                if x > xc && x < xc + 2.0 * d && (y - yc).abs() < d {
+                    let sx = ((x - xc) / (2.0 * d)).min(1.0);
+                    s.omega[c] = amp * (std::f64::consts::PI * sx).sin() * (y - yc) / d;
+                }
+            }
+        }
+        s
+    }
+
+    pub fn scenario_name(&self) -> &'static str {
+        match self.scenario {
+            Scenario::Cavity => "cavity",
+            Scenario::Cylinder => "cylinder",
+        }
+    }
+
+    pub fn solver_name(&self) -> &'static str {
+        if self.fft_poisson.is_some() {
+            "FFT/DST (direct)"
         } else {
-            None
-        };
-        Solver {
-            cfg,
-            n,
-            h,
-            nu,
-            omega: vec![0.0; n * n],
-            psi: vec![0.0; n * n],
-            sor,
-            min_len,
-            fft_poisson,
+            "SOR (iterative)"
         }
     }
 
-    /// Whether the direct FFT/DST Poisson solver is in use.
-    pub fn uses_fft(&self) -> bool {
-        self.fft_poisson.is_some()
-    }
-
-    /// Solve ∇²ψ = -ω with ψ = 0 on all walls. Uses the direct FFT/DST solver
-    /// if available (one exact pass), otherwise red-black SOR warm-started from
-    /// the current psi. SOR convergence uses the relative Cauchy change
-    /// max|Δψ| / max|ψ|, robust to the singular top corners of the cavity.
-    /// Returns (iterations, residual/relative-change).
+    /// Solve ∇²ψ = -ω subject to the scenario's ψ boundary conditions.
     pub fn poisson(&mut self) -> (usize, f64) {
-        let n = self.n;
-        let h2 = self.h * self.h;
-        // Direct FFT/DST solver: one exact pass, report the true max residual.
-        if let Some(fp) = self.fft_poisson.as_ref() {
-            fp.solve(&self.omega, &mut self.psi);
-            let p = &self.psi;
-            let om = &self.omega;
-            let res = (1..n - 1)
-                .into_par_iter()
-                .map(|j| {
-                    let mut mx = 0.0f64;
-                    for i in 1..n - 1 {
-                        let c = idx(i, j, n);
-                        let lap = (p[c + 1] + p[c - 1] + p[c + n] + p[c - n] - 4.0 * p[c]) / h2;
-                        let r = (lap + om[c]).abs();
-                        if r > mx {
-                            mx = r;
-                        }
-                    }
-                    mx
-                })
-                .reduce(|| 0.0f64, f64::max);
-            return (1, res);
+        if self.fft_poisson.is_some() {
+            return self.poisson_fft();
         }
+        self.poisson_sor()
+    }
 
+    fn poisson_fft(&mut self) -> (usize, f64) {
+        let nx = self.nx;
+        let h2 = self.h * self.h;
+        let fp = self.fft_poisson.as_ref().unwrap();
+        fp.solve(&self.omega, &mut self.psi);
+        let p = &self.psi;
+        let om = &self.omega;
+        let ny = self.ny;
+        let res = (1..ny - 1)
+            .into_par_iter()
+            .map(|j| {
+                let mut mx = 0.0f64;
+                for i in 1..nx - 1 {
+                    let c = idx(i, j, nx);
+                    let lap = (p[c + 1] + p[c - 1] + p[c + nx] + p[c - nx] - 4.0 * p[c]) / h2;
+                    let r = (lap + om[c]).abs();
+                    if r > mx {
+                        mx = r;
+                    }
+                }
+                mx
+            })
+            .reduce(|| 0.0f64, f64::max);
+        (1, res)
+    }
+
+    fn poisson_sor(&mut self) -> (usize, f64) {
+        let (nx, ny) = (self.nx, self.ny);
+        let h2 = self.h * self.h;
         let w = self.sor;
-        let mut it = 0;
-        let mut rel = 0.0;
-        // Enforce homogeneous Dirichlet boundary on psi.
-        for i in 0..n {
-            self.psi[idx(i, 0, n)] = 0.0;
-            self.psi[idx(i, n - 1, n)] = 0.0;
-            self.psi[idx(0, i, n)] = 0.0;
-            self.psi[idx(n - 1, i, n)] = 0.0;
+        // Impose fixed ψ (walls / inflow / solid).
+        for c in 0..nx * ny {
+            if self.psi_fixed[c] {
+                self.psi[c] = self.psi_val[c];
+            }
         }
+        let psi_fixed = &self.psi_fixed;
         let omega = &self.omega;
         let ptr = SendPtr(self.psi.as_mut_ptr());
         let min_len = self.min_len;
-        // Convergence is only tested every `check` sweeps: the cross-thread max
-        // reduction is far more expensive than a bare update sweep, so we run
-        // the plain (unreduced) sweep most of the time.
+        let outflow = self.outflow;
         let check = 4usize;
+        let mut it = 0;
+        let mut rel = 0.0;
         while it < self.cfg.poisson_max_it {
+            // Neumann outflow: copy the last interior column into the right wall.
+            if outflow {
+                for j in 0..ny {
+                    self.psi[idx(nx - 1, j, nx)] = self.psi[idx(nx - 2, j, nx)];
+                }
+            }
             let want_check = (it + 1) % check == 0;
             let mut max_dpsi = 0.0f64;
             let mut max_psi = 1e-30f64;
-            // Red-black Gauss-Seidel with over-relaxation, parallelised over
-            // contiguous row bands. The two colours are swept in turn; within a
-            // colour the row updates are independent (each reads only opposite
-            // colour neighbours), so the result is thread-count independent.
             for color in 0..2 {
-                if want_check {
-                    let (dmax, pmax) = (1..n - 1)
-                        .into_par_iter()
-                        .with_min_len(min_len)
-                        .map(|j| {
-                            let sp = ptr; // capture the whole Send/Sync wrapper
-                            let p = sp.0;
-                            let mut ld = 0.0f64;
-                            let mut lp = 1e-30f64;
-                            let mut i = 1 + ((j + color) & 1);
-                            while i < n - 1 {
-                                let c = idx(i, j, n);
-                                unsafe {
-                                    let sum = *p.add(c + 1)
-                                        + *p.add(c - 1)
-                                        + *p.add(c + n)
-                                        + *p.add(c - n);
-                                    let new = (sum + h2 * omega[c]) * 0.25;
-                                    let old = *p.add(c);
-                                    let dpsi = w * (new - old);
-                                    let val = old + dpsi;
-                                    *p.add(c) = val;
-                                    let ad = dpsi.abs();
-                                    if ad > ld {
-                                        ld = ad;
-                                    }
-                                    let ap = val.abs();
-                                    if ap > lp {
-                                        lp = ap;
-                                    }
-                                }
-                                i += 2;
-                            }
-                            (ld, lp)
-                        })
-                        .reduce(|| (0.0f64, 1e-30f64), |a, b| (a.0.max(b.0), a.1.max(b.1)));
-                    if dmax > max_dpsi {
-                        max_dpsi = dmax;
-                    }
-                    if pmax > max_psi {
-                        max_psi = pmax;
-                    }
-                } else {
-                    // Bare update sweep: no per-cell tracking, no reduction.
-                    // SAFETY: red-black ordering makes the per-cell writes
-                    // disjoint and independent of opposite-colour reads.
-                    (1..n - 1).into_par_iter().with_min_len(min_len).for_each(|j| {
-                        let sp = ptr;
-                        let p = sp.0;
-                        let mut i = 1 + ((j + color) & 1);
-                        while i < n - 1 {
-                            let c = idx(i, j, n);
+                let sweep = |j: usize| -> (f64, f64) {
+                    let sp = ptr;
+                    let p = sp.0;
+                    let mut ld = 0.0f64;
+                    let mut lp = 1e-30f64;
+                    let mut i = 1 + ((j + color) & 1);
+                    while i < nx - 1 {
+                        let c = idx(i, j, nx);
+                        if !psi_fixed[c] {
                             unsafe {
                                 let sum = *p.add(c + 1)
                                     + *p.add(c - 1)
-                                    + *p.add(c + n)
-                                    + *p.add(c - n);
+                                    + *p.add(c + nx)
+                                    + *p.add(c - nx);
                                 let new = (sum + h2 * omega[c]) * 0.25;
                                 let old = *p.add(c);
-                                *p.add(c) = old + w * (new - old);
+                                let dpsi = w * (new - old);
+                                let val = old + dpsi;
+                                *p.add(c) = val;
+                                let ad = dpsi.abs();
+                                if ad > ld {
+                                    ld = ad;
+                                }
+                                let ap = val.abs();
+                                if ap > lp {
+                                    lp = ap;
+                                }
                             }
-                            i += 2;
                         }
+                        i += 2;
+                    }
+                    (ld, lp)
+                };
+                if want_check {
+                    let (dmax, pmax) = (1..ny - 1)
+                        .into_par_iter()
+                        .with_min_len(min_len)
+                        .map(sweep)
+                        .reduce(|| (0.0f64, 1e-30f64), |a, b| (a.0.max(b.0), a.1.max(b.1)));
+                    max_dpsi = max_dpsi.max(dmax);
+                    max_psi = max_psi.max(pmax);
+                } else {
+                    (1..ny - 1).into_par_iter().with_min_len(min_len).for_each(|j| {
+                        sweep(j);
                     });
                 }
             }
@@ -229,57 +331,100 @@ impl Solver {
                 }
             }
         }
+        if outflow {
+            for j in 0..ny {
+                self.psi[idx(nx - 1, j, nx)] = self.psi[idx(nx - 2, j, nx)];
+            }
+        }
         (it, rel)
     }
 
-    /// Apply Thom's wall-vorticity boundary condition given current psi.
-    /// Stationary walls: ω = -2 ψ_in / h².
-    /// Moving top lid  : ω = -2 ψ_in / h² - 2 U_lid / h.
+    /// Wall / obstacle vorticity boundary conditions given the current ψ.
     pub fn apply_vorticity_bc(&mut self) {
-        let n = self.n;
+        match self.scenario {
+            Scenario::Cavity => self.bc_cavity(),
+            Scenario::Cylinder => self.bc_cylinder(),
+        }
+    }
+
+    fn bc_cavity(&mut self) {
+        let n = self.nx;
         let h = self.h;
         let h2 = h * h;
         for i in 0..n {
-            // bottom wall (j = 0), stationary
             self.omega[idx(i, 0, n)] = -2.0 * self.psi[idx(i, 1, n)] / h2;
-            // top wall (j = n-1), moving lid
             self.omega[idx(i, n - 1, n)] =
-                -2.0 * self.psi[idx(i, n - 2, n)] / h2 - 2.0 * self.cfg.u_lid / h;
+                -2.0 * self.psi[idx(i, n - 2, n)] / h2 - 2.0 * self.u_in / h;
         }
         for j in 0..n {
-            // left wall (i = 0), stationary
             self.omega[idx(0, j, n)] = -2.0 * self.psi[idx(1, j, n)] / h2;
-            // right wall (i = n-1), stationary
             self.omega[idx(n - 1, j, n)] = -2.0 * self.psi[idx(n - 2, j, n)] / h2;
         }
     }
 
-    /// Compute L(ω) = J(ψ, ω) + ν∇²ω on interior nodes into `rhs`.
-    /// Assumes psi already solved and wall vorticity BC applied for `om`.
+    fn bc_cylinder(&mut self) {
+        let (nx, ny) = (self.nx, self.ny);
+        let h2 = self.h * self.h;
+        // inflow (irrotational) and free-slip channel walls: ω = 0
+        for j in 0..ny {
+            self.omega[idx(0, j, nx)] = 0.0;
+        }
+        for i in 0..nx {
+            self.omega[idx(i, 0, nx)] = 0.0;
+            self.omega[idx(i, ny - 1, nx)] = 0.0;
+        }
+        // no-slip cylinder surface: Thom's formula on solid cells that touch fluid
+        for j in 1..ny - 1 {
+            for i in 1..nx - 1 {
+                let c = idx(i, j, nx);
+                if !self.solid[c] {
+                    continue;
+                }
+                let mut sum = 0.0;
+                let mut cnt = 0;
+                for (ni, nj) in [(i + 1, j), (i - 1, j), (i, j + 1), (i, j - 1)] {
+                    let nb = idx(ni, nj, nx);
+                    if !self.solid[nb] {
+                        sum += -2.0 * (self.psi[nb] - self.psi[c]) / h2;
+                        cnt += 1;
+                    }
+                }
+                self.omega[c] = if cnt > 0 { sum / cnt as f64 } else { 0.0 };
+            }
+        }
+        // outflow (right): Neumann, ω copied from the last interior column
+        for j in 0..ny {
+            self.omega[idx(nx - 1, j, nx)] = self.omega[idx(nx - 2, j, nx)];
+        }
+    }
+
+    /// L(ω) = J(ψ, ω) + ν∇²ω on interior fluid nodes.
     fn rhs(&self, om: &[f64], rhs: &mut [f64]) {
-        let n = self.n;
+        let (nx, ny) = (self.nx, self.ny);
         let h2 = self.h * self.h;
         let inv12h2 = 1.0 / (12.0 * h2);
         let nu = self.nu;
         let p = &self.psi;
-        // One row of output per rayon task; each row reads its neighbour rows
-        // of the (immutable) psi and omega fields.
-        rhs.par_chunks_mut(n).enumerate().for_each(|(j, row)| {
-            if j == 0 || j == n - 1 {
+        let solid = &self.solid;
+        rhs.par_chunks_mut(nx).enumerate().for_each(|(j, row)| {
+            if j == 0 || j == ny - 1 {
                 return;
             }
-            for i in 1..n - 1 {
-                let c = idx(i, j, n);
-                let e = idx(i + 1, j, n);
-                let we = idx(i - 1, j, n);
-                let no = idx(i, j + 1, n);
-                let so = idx(i, j - 1, n);
-                let ne = idx(i + 1, j + 1, n);
-                let nw = idx(i - 1, j + 1, n);
-                let se = idx(i + 1, j - 1, n);
-                let sw = idx(i - 1, j - 1, n);
+            for i in 1..nx - 1 {
+                let c = idx(i, j, nx);
+                if solid[c] {
+                    row[i] = 0.0;
+                    continue;
+                }
+                let e = c + 1;
+                let we = c - 1;
+                let no = c + nx;
+                let so = c - nx;
+                let ne = c + nx + 1;
+                let nw = c + nx - 1;
+                let se = c - nx + 1;
+                let sw = c - nx - 1;
 
-                // Arakawa Jacobian J(p, z) = (J1 + J2 + J3)/3
                 let j1 = (p[e] - p[we]) * (om[no] - om[so])
                     - (p[no] - p[so]) * (om[e] - om[we]);
                 let j2 = p[e] * (om[ne] - om[se]) - p[we] * (om[nw] - om[sw])
@@ -289,28 +434,28 @@ impl Solver {
                     - om[e] * (p[ne] - p[se])
                     + om[we] * (p[nw] - p[sw]);
                 let jac = (j1 + j2 + j3) * inv12h2;
-
-                // viscous term
                 let lap = (om[e] + om[we] + om[no] + om[so] - 4.0 * om[c]) / h2;
-
-                // dω/dt = -(u·∇)ω + ν∇²ω = J(ψ,ω) + ν∇²ω
                 row[i] = jac + nu * lap;
             }
         });
     }
 
-    /// Maximum velocity magnitude (for CFL / adaptive dt).
     pub fn max_speed(&self) -> f64 {
-        let n = self.n;
+        let (nx, ny) = (self.nx, self.ny);
         let h = self.h;
         let p = &self.psi;
-        let interior_max = (1..n - 1)
+        let solid = &self.solid;
+        let m = (1..ny - 1)
             .into_par_iter()
             .map(|j| {
                 let mut umax = 0.0f64;
-                for i in 1..n - 1 {
-                    let u = (p[idx(i, j + 1, n)] - p[idx(i, j - 1, n)]) / (2.0 * h);
-                    let v = -(p[idx(i + 1, j, n)] - p[idx(i - 1, j, n)]) / (2.0 * h);
+                for i in 1..nx - 1 {
+                    let c = idx(i, j, nx);
+                    if solid[c] {
+                        continue;
+                    }
+                    let u = (p[c + nx] - p[c - nx]) / (2.0 * h);
+                    let v = -(p[c + 1] - p[c - 1]) / (2.0 * h);
                     let s = (u * u + v * v).sqrt();
                     if s > umax {
                         umax = s;
@@ -319,92 +464,80 @@ impl Solver {
                 umax
             })
             .reduce(|| 0.0f64, f64::max);
-        interior_max.max(self.cfg.u_lid) // lid guarantees at least this
+        m.max(self.u_in)
     }
 
-    /// One SSP-RK3 step. Returns (poisson_iters_total, poisson_res_last).
+    /// One SSP-RK3 step. Returns (poisson_iters, poisson_residual).
     pub fn step(&mut self, dt: f64) -> (usize, f64) {
-        let n = self.n;
-        let size = n * n;
+        let (nx, ny) = (self.nx, self.ny);
+        let size = nx * ny;
         let mut k = vec![0.0f64; size];
-        let mut it_total = 0;
+        let solid = self.solid.clone();
+
+        let combine = |dst: &mut [f64], a: &[f64], b: &[f64], k: &[f64], ca: f64, cb: f64, dt: f64| {
+            dst.par_chunks_mut(nx).enumerate().for_each(|(j, row)| {
+                if j == 0 || j == ny - 1 {
+                    return;
+                }
+                for i in 1..nx - 1 {
+                    let c = idx(i, j, nx);
+                    if solid[c] {
+                        continue;
+                    }
+                    row[i] = ca * a[c] + cb * (b[c] + dt * k[c]);
+                }
+            });
+        };
 
         // Stage 1
-        let (it, _r) = self.poisson();
+        let (it1, _r) = self.poisson();
         self.apply_vorticity_bc();
-        it_total += it;
-        let cur = self.omega.clone();
-        self.rhs(&cur, &mut k);
-        let omega0 = cur;
+        let omega0 = self.omega.clone();
+        self.rhs(&omega0, &mut k);
         let mut omega1 = omega0.clone();
-        omega1.par_chunks_mut(n).enumerate().for_each(|(j, row)| {
-            if j == 0 || j == n - 1 {
-                return;
-            }
-            for i in 1..n - 1 {
-                let c = idx(i, j, n);
-                row[i] = omega0[c] + dt * k[c];
-            }
-        });
+        combine(&mut omega1, &omega0, &omega0, &k, 0.0, 1.0, dt);
 
         // Stage 2
         self.omega = omega1;
-        let (it, _r) = self.poisson();
+        let (it2, _r) = self.poisson();
         self.apply_vorticity_bc();
-        it_total += it;
         let cur = self.omega.clone();
         self.rhs(&cur, &mut k);
         let mut omega2 = cur.clone();
-        omega2.par_chunks_mut(n).enumerate().for_each(|(j, row)| {
-            if j == 0 || j == n - 1 {
-                return;
-            }
-            for i in 1..n - 1 {
-                let c = idx(i, j, n);
-                row[i] = 0.75 * omega0[c] + 0.25 * (cur[c] + dt * k[c]);
-            }
-        });
+        combine(&mut omega2, &omega0, &cur, &k, 0.75, 0.25, dt);
 
         // Stage 3
         self.omega = omega2;
-        let (it, res_last) = self.poisson();
+        let (it3, res) = self.poisson();
         self.apply_vorticity_bc();
-        it_total += it;
         let cur = self.omega.clone();
         self.rhs(&cur, &mut k);
         let mut omega_new = cur.clone();
-        omega_new.par_chunks_mut(n).enumerate().for_each(|(j, row)| {
-            if j == 0 || j == n - 1 {
-                return;
-            }
-            for i in 1..n - 1 {
-                let c = idx(i, j, n);
-                row[i] = (1.0 / 3.0) * omega0[c] + (2.0 / 3.0) * (cur[c] + dt * k[c]);
-            }
-        });
+        combine(&mut omega_new, &omega0, &cur, &k, 1.0 / 3.0, 2.0 / 3.0, dt);
         self.omega = omega_new;
 
-        (it_total, res_last)
+        (it1 + it2 + it3, res)
     }
 
-    /// Diagnostics: kinetic energy, enstrophy, circulation, max speed.
+    /// (kinetic energy, enstrophy, circulation, max speed) over fluid cells.
     pub fn diagnostics(&self) -> (f64, f64, f64, f64) {
-        let n = self.n;
+        let (nx, ny) = (self.nx, self.ny);
         let h = self.h;
         let da = h * h;
         let p = &self.psi;
         let om = &self.omega;
-        (1..n - 1)
+        let solid = &self.solid;
+        (1..ny - 1)
             .into_par_iter()
             .map(|j| {
-                let mut ke = 0.0;
-                let mut ens = 0.0;
-                let mut circ = 0.0;
-                let mut umax = 0.0f64;
-                for i in 1..n - 1 {
-                    let c = idx(i, j, n);
-                    let u = (p[idx(i, j + 1, n)] - p[idx(i, j - 1, n)]) / (2.0 * h);
-                    let v = -(p[idx(i + 1, j, n)] - p[idx(i - 1, j, n)]) / (2.0 * h);
+                let (mut ke, mut ens, mut circ, mut umax) = (0.0, 0.0, 0.0, 0.0f64);
+                for i in 1..nx - 1 {
+                    let c = idx(i, j, nx);
+                    if solid[c] {
+                        continue;
+                    }
+                    let u = (p[c + nx] - p[c - nx]) / (2.0 * h);
+                    let v = -(p[c + 1] - p[c - 1]) / (2.0 * h);
                     ke += 0.5 * (u * u + v * v) * da;
                     ens += 0.5 * om[c] * om[c] * da;
                     circ += om[c] * da;
@@ -421,32 +554,41 @@ impl Solver {
             )
     }
 
-    /// Write current fields (omega, psi, u, v) as raw little-endian f64.
+    /// Write current fields (omega, psi, u, v) as raw little-endian f64
+    /// (four nx*ny blocks, row-major, index j*nx + i).
     pub fn write_frame(&self, path: &str) {
-        let n = self.n;
+        let (nx, ny) = (self.nx, self.ny);
         let h = self.h;
-        let mut buf: Vec<u8> = Vec::with_capacity(4 * n * n * 8);
-        // omega
+        let mut buf: Vec<u8> = Vec::with_capacity(4 * nx * ny * 8);
         for v in &self.omega {
             buf.extend_from_slice(&v.to_le_bytes());
         }
-        // psi
         for v in &self.psi {
             buf.extend_from_slice(&v.to_le_bytes());
         }
-        // u, v (central diff; boundary values set from wall conditions)
-        let mut uu = vec![0.0f64; n * n];
-        let mut vv = vec![0.0f64; n * n];
-        for j in 1..n - 1 {
-            for i in 1..n - 1 {
-                uu[idx(i, j, n)] =
-                    (self.psi[idx(i, j + 1, n)] - self.psi[idx(i, j - 1, n)]) / (2.0 * h);
-                vv[idx(i, j, n)] =
-                    -(self.psi[idx(i + 1, j, n)] - self.psi[idx(i - 1, j, n)]) / (2.0 * h);
+        let mut uu = vec![0.0f64; nx * ny];
+        let mut vv = vec![0.0f64; nx * ny];
+        for j in 1..ny - 1 {
+            for i in 1..nx - 1 {
+                let c = idx(i, j, nx);
+                if self.solid[c] {
+                    continue;
+                }
+                uu[c] = (self.psi[c + nx] - self.psi[c - nx]) / (2.0 * h);
+                vv[c] = -(self.psi[c + 1] - self.psi[c - 1]) / (2.0 * h);
             }
         }
-        for i in 0..n {
-            uu[idx(i, n - 1, n)] = self.cfg.u_lid; // moving lid
+        match self.scenario {
+            Scenario::Cavity => {
+                for i in 0..nx {
+                    uu[idx(i, ny - 1, nx)] = self.u_in; // moving lid
+                }
+            }
+            Scenario::Cylinder => {
+                for j in 0..ny {
+                    uu[idx(0, j, nx)] = self.u_in; // inflow
+                }
+            }
         }
         for v in &uu {
             buf.extend_from_slice(&v.to_le_bytes());
@@ -455,7 +597,16 @@ impl Solver {
             buf.extend_from_slice(&v.to_le_bytes());
         }
         let f = File::create(path).expect("create frame");
-        let mut w = BufWriter::new(f);
-        w.write_all(&buf).expect("write frame");
+        BufWriter::new(f).write_all(&buf).expect("write frame");
+    }
+
+    /// Write the solid mask as nx*ny bytes (1 = solid), for the visualiser.
+    pub fn write_mask(&self, path: &str) {
+        let bytes: Vec<u8> = self.solid.iter().map(|&s| s as u8).collect();
+        std::fs::write(path, bytes).expect("write mask");
+    }
+
+    pub fn has_solid(&self) -> bool {
+        self.solid.iter().any(|&s| s)
     }
 }

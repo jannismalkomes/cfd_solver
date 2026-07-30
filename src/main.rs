@@ -29,12 +29,8 @@ fn main() {
     let nthreads = rayon::current_num_threads();
 
     let mut solver = Solver::new(cfg.clone());
-    let n = solver.n;
-    let solver_name = if solver.uses_fft() {
-        "FFT/DST (direct)"
-    } else {
-        "SOR (iterative)"
-    };
+    let (nx, ny) = (solver.nx, solver.ny);
+    let solver_name = solver.solver_name();
 
     fs::create_dir_all(&cfg.outdir).expect("mkdir outdir");
     // Clear any stale frames from a previous run (e.g. a different grid size),
@@ -46,14 +42,23 @@ fn main() {
     // metadata for the visualiser
     {
         let mut m = File::create(format!("{}/meta.txt", cfg.outdir)).unwrap();
-        writeln!(m, "n={}", n).unwrap();
-        writeln!(m, "L={}", cfg.l).unwrap();
+        writeln!(m, "scenario={}", solver.scenario_name()).unwrap();
+        writeln!(m, "nx={}", nx).unwrap();
+        writeln!(m, "ny={}", ny).unwrap();
+        writeln!(m, "Lx={}", solver.lx).unwrap();
+        writeln!(m, "Ly={}", solver.ly).unwrap();
         writeln!(m, "Re={}", cfg.re).unwrap();
         writeln!(m, "nu={}", solver.nu).unwrap();
         writeln!(m, "u_lid={}", cfg.u_lid).unwrap();
         writeln!(m, "t_end={}", cfg.t_end).unwrap();
         writeln!(m, "cfl={}", cfg.cfl).unwrap();
         writeln!(m, "solver={}", solver_name).unwrap();
+    }
+    // Solid mask (cylinder scenario) for the visualiser to overlay the obstacle.
+    if solver.has_solid() {
+        solver.write_mask(&format!("{}/mask.bin", cfg.outdir));
+    } else {
+        let _ = fs::remove_file(format!("{}/mask.bin", cfg.outdir));
     }
 
     let mut diag = BufWriter::new(File::create(format!("{}/diagnostics.csv", cfg.outdir)).unwrap());
@@ -64,10 +69,10 @@ fn main() {
     .unwrap();
 
     println!(
-        "2D incompressible Euler (vorticity-streamfunction) | lid-driven cavity\n\
-         grid = {n}x{n}, Re = {}, nu = {:.3e}, t_end = {}, CFL = {}, threads = {}\n\
+        "2D incompressible vorticity-streamfunction | scenario: {}\n\
+         grid = {nx}x{ny}, Re = {}, nu = {:.3e}, t_end = {}, CFL = {}, threads = {}\n\
          Poisson solver: {}",
-        cfg.re, solver.nu, cfg.t_end, cfg.cfl, nthreads, solver_name
+        solver.scenario_name(), cfg.re, solver.nu, cfg.t_end, cfg.cfl, nthreads, solver_name
     );
 
     let start = Instant::now();

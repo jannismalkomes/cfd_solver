@@ -1,10 +1,38 @@
-# 2D Euler solver — lid-driven cavity
+# 2D incompressible flow solver — cavity & vortex street
 
-A from-scratch Rust solver for the **2D incompressible Euler equations** in
-vorticity–streamfunction form, applied to the classic **lid-driven cavity**. The
-solver's only crate dependency is [rayon](https://crates.io/crates/rayon) for
+A from-scratch Rust solver for the **2D incompressible vorticity-transport
+equations** in vorticity–streamfunction form. Two scenarios (`--scenario`):
+
+- **`cavity`** (default) — the classic **lid-driven cavity** in the high-Reynolds
+  "Euler limit".
+- **`cylinder`** — flow past a circular cylinder in a channel, producing a
+  **Kármán vortex street**.
+
+The solver's only crate dependency is [rayon](https://crates.io/crates/rayon) for
 multithreading; figures are produced by a bundled Python script that the binary
 invokes automatically after a run.
+
+## Scenarios
+
+| | `cavity` | `cylinder` |
+|---|----------|------------|
+| domain | square `1×1` | channel `4×1` |
+| grid | `n×n` (FFT-friendly `n = 2^k+1`) | `nx×ny`, `ny = --n` |
+| driving | moving top lid | uniform inflow |
+| walls | no-slip (Thom) | free-slip channel + Neumann outflow |
+| obstacle | — | immersed no-slip cylinder (staircase mask) |
+| Poisson | FFT/DST (direct) | SOR (masked domain) |
+| regime | high-Re "Euler limit" | moderate `Re_D ≈ 150` |
+
+**On physics:** a Kármán vortex street is a *viscous* (Navier–Stokes) phenomenon —
+shedding is driven by boundary-layer separation, so the cylinder case runs at a
+moderate diameter-Reynolds number (`Re_D = U·D/ν`, default 150), not the inviscid
+limit. A tiny cylinder offset + wake seed break the symmetry to start shedding.
+
+```bash
+./target/release/cfd_solver --scenario cylinder            # defaults: 257×65, Re_D=150
+./target/release/cfd_solver --scenario cylinder --n 97 --re 200 --tend 100
+```
 
 ### Source layout
 | file | contents |
@@ -93,11 +121,12 @@ All flags are optional; each takes one value (`--flag value`).
 
 | Flag | Values | Default | Description |
 |------|--------|---------|-------------|
-| `--n` | integer | `129` | Grid nodes per side (square `n×n`). For the FFT solver `n−1` must be a power of two, i.e. `n = 2^k+1` (33, 65, 129, 257, 513, …). |
-| `--re` | float | `5000` | Reynolds number; sets viscosity `ν = U·L/Re`. Larger → closer to the pure Euler limit. |
-| `--tend` | float | `30` | Final simulation time (in lid-transit units). |
+| `--scenario` | `cavity` \| `cylinder` | `cavity` | Simulation setup (see [Scenarios](#scenarios)). Sets scenario-appropriate defaults for unset flags. |
+| `--n` | integer | `129` (cavity), `65` (cylinder) | Transverse resolution. Cavity: square `n×n` (FFT wants `n = 2^k+1`). Cylinder: channel-height nodes `ny` (width follows the 4:1 aspect). |
+| `--re` | float | `5000` (cavity), `150` (cylinder) | Reynolds number. Cavity: `ν = U·L/Re` (large → Euler limit). Cylinder: diameter-based `Re_D = U·D/ν`. |
+| `--tend` | float | `30` (cavity), `60` (cylinder) | Final simulation time. |
 | `--cfl` | float | `0.4` | Target CFL number for the adaptive time step. |
-| `--out-every` | float | `0.25` | Simulation-time interval between saved field snapshots (frames). |
+| `--out-every` | float | `0.25` (cavity), `0.5` (cylinder) | Simulation-time interval between saved field snapshots (frames). |
 | `--threads` | integer | `0` | Worker threads. `0` = all logical cores. Results are identical regardless of value. |
 | `--solver` | `auto` \| `fft` \| `sor` | `auto` | Poisson solver. `auto` picks `fft` when `n−1` is a power of two, else `sor`. |
 | `--view` | `none` \| `save` \| `show` | `save` | Visualisation: `save` writes figures to `<outdir>/figures/`; `show` also displays them; `none` skips it. |
