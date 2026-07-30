@@ -1,0 +1,8 @@
+n=513
+L=1
+Re=5000
+nu=0.0002
+u_lid=1
+t_end=2
+cfl=0.4
+solver=FFT/DST (direct)

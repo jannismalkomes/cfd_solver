@@ -227,12 +227,16 @@ def fig_solver(meta):
     a.legend(fontsize=8, frameon=False)
     a.set_ylim(0, meta["cfl"] * 1.3)
 
-    # 5. Poisson iterations per step (SOR work, warm-started)
+    # 5. Poisson solve residual (log) — direct FFT solve reaches machine
+    #    precision each step; SOR sits at its iterative tolerance.
     a = ax[1, 1]
-    a.plot(t[m], d["poisson_iters"][m], color=ACCENT, lw=1.2)
-    a.set_title("(e) Poisson SOR iterations / step (3 stages)", loc="left",
+    solver = meta.get("solver", "")
+    res = d["poisson_residual"]
+    good = m & (res > 0)
+    a.semilogy(t[good], res[good], color=ACCENT, lw=1.2)
+    a.set_title(f"(e) Poisson residual  |∇²ψ+ω|   [{solver}]", loc="left",
                 fontweight="bold", fontsize=9)
-    a.set_xlabel("time"); a.set_ylabel("iterations")
+    a.set_xlabel("time"); a.set_ylabel("max residual")
 
     # 6. Circulation (∫ω dA) — conservation / vorticity budget
     a = ax[1, 2]

@@ -18,9 +18,203 @@
 //!
 //! Output: raw f64 field frames + a diagnostics CSV describing solver behaviour.
 
+use rayon::prelude::*;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::time::Instant;
+
+/// Raw-pointer wrapper that is `Send + Sync` so the red-black SOR sweep can
+/// write disjoint cells of `psi` from several threads at once. The red-black
+/// ordering guarantees that within one colour sweep every thread writes only
+/// same-colour cells and reads only opposite-colour neighbours (which are not
+/// written during that sweep), so there is no data race.
+#[derive(Copy, Clone)]
+struct SendPtr(*mut f64);
+unsafe impl Send for SendPtr {}
+unsafe impl Sync for SendPtr {}
+
+// ---------------------------------------------------------------------------
+// Fast direct Poisson solver via the discrete sine transform (DST-I).
+//
+// The 5-point Laplacian with homogeneous Dirichlet boundaries is diagonalised
+// by the sine basis  sin(π k i /(N-1)).  Transforming ω into that basis, the
+// Poisson equation ∇²ψ = −ω becomes a pointwise division by the eigenvalues
+//     λ_p + λ_q ,   λ_k = −(4/h²) sin²(π k /(2(N-1)))
+// followed by an inverse transform.  This is a *direct* solve — exact to
+// round-off in a single pass, no iteration and no warm start — costing
+// O(m² log m) versus O(m² · #sweeps) for SOR.
+//
+// The DST-I of length m is evaluated through a radix-2 FFT of length
+// 2(m+1) = 2(n-1); requiring n-1 to be a power of two (n = 2^k + 1).
+// ---------------------------------------------------------------------------
+
+/// Iterative radix-2 Cooley-Tukey FFT for power-of-two lengths (forward only —
+/// the inverse DST is built from the forward transform as well).
+struct Fft {
+    n: usize,
+    rev: Vec<usize>, // bit-reversal permutation
+    tw_re: Vec<f64>, // twiddle factors exp(-2πi k/n), k = 0..n/2
+    tw_im: Vec<f64>,
+}
+
+impl Fft {
+    fn new(n: usize) -> Fft {
+        assert!(n.is_power_of_two());
+        let log2n = n.trailing_zeros();
+        let mut rev = vec![0usize; n];
+        for i in 1..n {
+            rev[i] = (rev[i >> 1] >> 1) | ((i & 1) << (log2n - 1));
+        }
+        let half = n / 2;
+        let mut tw_re = vec![0.0; half.max(1)];
+        let mut tw_im = vec![0.0; half.max(1)];
+        for k in 0..half {
+            let ang = -2.0 * std::f64::consts::PI * (k as f64) / (n as f64);
+            tw_re[k] = ang.cos();
+            tw_im[k] = ang.sin();
+        }
+        Fft { n, rev, tw_re, tw_im }
+    }
+
+    /// In-place forward FFT of the complex array (re, im), both length n.
+    fn transform(&self, re: &mut [f64], im: &mut [f64]) {
+        let n = self.n;
+        for i in 0..n {
+            let j = self.rev[i];
+            if j > i {
+                re.swap(i, j);
+                im.swap(i, j);
+            }
+        }
+        let mut len = 2;
+        while len <= n {
+            let half = len / 2;
+            let step = n / len;
+            let mut base = 0;
+            while base < n {
+                let mut k = 0;
+                for j in 0..half {
+                    let wr = self.tw_re[k];
+                    let wi = self.tw_im[k];
+                    let a = base + j;
+                    let b = a + half;
+                    let tr = wr * re[b] - wi * im[b];
+                    let ti = wr * im[b] + wi * re[b];
+                    re[b] = re[a] - tr;
+                    im[b] = im[a] - ti;
+                    re[a] += tr;
+                    im[a] += ti;
+                    k += step;
+                }
+                base += len;
+            }
+            len <<= 1;
+        }
+    }
+}
+
+/// Direct Poisson solver for ∇²ψ = −ω on the interior with ψ = 0 on the walls.
+struct PoissonFft {
+    n_grid: usize,   // full grid size (n)
+    m: usize,        // interior size (n - 2)
+    fft: Fft,        // FFT of length 2(n-1)
+    denom: Vec<f64>, // −scale / (λ_p + λ_q), scale folded in (m×m, row-major)
+}
+
+impl PoissonFft {
+    fn new(n: usize, h: f64) -> PoissonFft {
+        let m = n - 2;
+        let nn = 2 * (n - 1); // = 2(m+1)
+        let fft = Fft::new(nn);
+        let m1 = (n - 1) as f64;
+        // (2/(m+1))² accounts for the two inverse transforms; folded into denom.
+        let scale = (2.0 / m1).powi(2);
+        let h2 = h * h;
+        let mut lam = vec![0.0f64; m];
+        for k in 0..m {
+            let s = (std::f64::consts::PI * ((k + 1) as f64) / (2.0 * m1)).sin();
+            lam[k] = -(4.0 / h2) * s * s;
+        }
+        let mut denom = vec![0.0f64; m * m];
+        for q in 0..m {
+            for p in 0..m {
+                denom[q * m + p] = -scale / (lam[p] + lam[q]);
+            }
+        }
+        PoissonFft { n_grid: n, m, fft, denom }
+    }
+
+    /// DST-I of a length-m row, in place. Uses an odd extension of length
+    /// 2(m+1): the forward FFT of that extension is purely imaginary and equals
+    /// −2i times the DST-I, so the DST is −Im(FFT)/2. `re`,`im` are scratch of
+    /// length 2(m+1).
+    fn dst1_into(&self, row: &mut [f64], re: &mut [f64], im: &mut [f64]) {
+        let m = self.m;
+        let nn = self.fft.n;
+        for x in re.iter_mut() {
+            *x = 0.0;
+        }
+        for x in im.iter_mut() {
+            *x = 0.0;
+        }
+        for j in 1..=m {
+            re[j] = row[j - 1];
+            re[nn - j] = -row[j - 1];
+        }
+        self.fft.transform(re, im);
+        for k in 1..=m {
+            row[k - 1] = -0.5 * im[k];
+        }
+    }
+
+    /// In-place square transpose (to reuse the row transform for columns).
+    fn transpose(a: &mut [f64], m: usize) {
+        for i in 0..m {
+            for j in (i + 1)..m {
+                a.swap(i * m + j, j * m + i);
+            }
+        }
+    }
+
+    /// Forward 2D DST-I on the m×m interior array (rows, then columns).
+    fn dst2_forward(&self, a: &mut [f64]) {
+        let m = self.m;
+        let nn = self.fft.n;
+        a.par_chunks_mut(m).for_each_init(
+            || (vec![0.0f64; nn], vec![0.0f64; nn]),
+            |(re, im), row| self.dst1_into(row, re, im),
+        );
+        Self::transpose(a, m);
+        a.par_chunks_mut(m).for_each_init(
+            || (vec![0.0f64; nn], vec![0.0f64; nn]),
+            |(re, im), row| self.dst1_into(row, re, im),
+        );
+        Self::transpose(a, m);
+    }
+
+    /// Solve ∇²ψ = −ω. Reads the interior of `omega_full`, writes the interior
+    /// of `psi_full` (wall values are left untouched — they stay zero).
+    fn solve(&self, omega_full: &[f64], psi_full: &mut [f64]) {
+        let n = self.n_grid;
+        let m = self.m;
+        let mut a = vec![0.0f64; m * m];
+        for q in 0..m {
+            for p in 0..m {
+                a[q * m + p] = omega_full[(q + 1) * n + (p + 1)];
+            }
+        }
+        self.dst2_forward(&mut a); // ω̂ = S ω S
+        for (v, d) in a.iter_mut().zip(self.denom.iter()) {
+            *v *= *d; // Ψ̂ = −ω̂ / (λ_p+λ_q), scale folded in
+        }
+        self.dst2_forward(&mut a); // second forward transform = inverse (scaled)
+        for q in 0..m {
+            for p in 0..m {
+                psi_full[(q + 1) * n + (p + 1)] = a[q * m + p];
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 struct Config {
@@ -33,6 +227,8 @@ struct Config {
     out_every: f64, // time between field snapshots
     poisson_tol: f64,
     poisson_max_it: usize,
+    threads: usize,     // 0 = use all available cores
+    solver: String,     // "auto" | "fft" | "sor"
     outdir: String,
 }
 
@@ -48,6 +244,8 @@ impl Default for Config {
             out_every: 0.25,
             poisson_tol: 1e-5,
             poisson_max_it: 2000,
+            threads: 0,
+            solver: "auto".to_string(),
             outdir: "output".to_string(),
         }
     }
@@ -61,6 +259,8 @@ struct Solver {
     omega: Vec<f64>, // vorticity
     psi: Vec<f64>,   // streamfunction
     sor: f64,        // SOR relaxation factor
+    min_len: usize,  // min rows per rayon task (caps task count ~= #threads)
+    fft_poisson: Option<PoissonFft>, // direct solver; None -> iterative SOR
 }
 
 #[inline(always)]
@@ -75,6 +275,30 @@ impl Solver {
         let nu = cfg.u_lid * cfg.l / cfg.re;
         // Optimal SOR factor for the model Poisson problem on an n x n grid.
         let sor = 2.0 / (1.0 + (std::f64::consts::PI / (n as f64)).sin());
+        // Split the interior rows into ~#threads contiguous bands so each rayon
+        // sweep dispatches only a handful of tasks (fine-grained splitting would
+        // cost more in fork/join than the arithmetic saves at small grids).
+        let nthreads = rayon::current_num_threads().max(1);
+        let min_len = ((n - 2) / nthreads).max(1);
+        // Choose the Poisson solver. The FFT/DST direct solver needs n-1 to be a
+        // power of two; "auto" uses it when possible and falls back to SOR.
+        let power2 = (n - 1).is_power_of_two();
+        let use_fft = match cfg.solver.as_str() {
+            "sor" => false,
+            "fft" => {
+                assert!(
+                    power2,
+                    "--solver fft requires n-1 to be a power of two (n = 2^k + 1); got n = {n}"
+                );
+                true
+            }
+            _ => power2, // "auto"
+        };
+        let fft_poisson = if use_fft {
+            Some(PoissonFft::new(n, h))
+        } else {
+            None
+        };
         Solver {
             cfg,
             n,
@@ -83,6 +307,8 @@ impl Solver {
             omega: vec![0.0; n * n],
             psi: vec![0.0; n * n],
             sor,
+            min_len,
+            fft_poisson,
         }
     }
 
@@ -95,6 +321,29 @@ impl Solver {
     fn poisson(&mut self) -> (usize, f64) {
         let n = self.n;
         let h2 = self.h * self.h;
+        // Direct FFT/DST solver: one exact pass, report the true max residual.
+        if let Some(fp) = self.fft_poisson.as_ref() {
+            fp.solve(&self.omega, &mut self.psi);
+            let p = &self.psi;
+            let om = &self.omega;
+            let res = (1..n - 1)
+                .into_par_iter()
+                .map(|j| {
+                    let mut mx = 0.0f64;
+                    for i in 1..n - 1 {
+                        let c = idx(i, j, n);
+                        let lap = (p[c + 1] + p[c - 1] + p[c + n] + p[c - n] - 4.0 * p[c]) / h2;
+                        let r = (lap + om[c]).abs();
+                        if r > mx {
+                            mx = r;
+                        }
+                    }
+                    mx
+                })
+                .reduce(|| 0.0f64, f64::max);
+            return (1, res);
+        }
+
         let w = self.sor;
         let mut it = 0;
         let mut rel = 0.0;
@@ -105,39 +354,94 @@ impl Solver {
             self.psi[idx(0, i, n)] = 0.0;
             self.psi[idx(n - 1, i, n)] = 0.0;
         }
+        let omega = &self.omega;
+        let ptr = SendPtr(self.psi.as_mut_ptr());
+        let min_len = self.min_len;
+        // Convergence is only tested every `check` sweeps: the cross-thread max
+        // reduction is far more expensive than a bare update sweep, so we run
+        // the plain (unreduced) sweep most of the time.
+        let check = 4usize;
         while it < self.cfg.poisson_max_it {
+            let want_check = (it + 1) % check == 0;
             let mut max_dpsi = 0.0f64;
             let mut max_psi = 1e-30f64;
-            // Red-black Gauss-Seidel with over-relaxation.
+            // Red-black Gauss-Seidel with over-relaxation, parallelised over
+            // contiguous row bands. The two colours are swept in turn; within a
+            // colour the row updates are independent (each reads only opposite
+            // colour neighbours), so the result is thread-count independent.
             for color in 0..2 {
-                for j in 1..n - 1 {
-                    // start index so that (i + j) parity == color
-                    let mut i = 1 + ((j + color) & 1);
-                    while i < n - 1 {
-                        let c = idx(i, j, n);
-                        let sum = self.psi[idx(i + 1, j, n)]
-                            + self.psi[idx(i - 1, j, n)]
-                            + self.psi[idx(i, j + 1, n)]
-                            + self.psi[idx(i, j - 1, n)];
-                        let new = (sum + h2 * self.omega[c]) * 0.25;
-                        let dpsi = w * (new - self.psi[c]);
-                        self.psi[c] += dpsi;
-                        let ad = dpsi.abs();
-                        if ad > max_dpsi {
-                            max_dpsi = ad;
-                        }
-                        let ap = self.psi[c].abs();
-                        if ap > max_psi {
-                            max_psi = ap;
-                        }
-                        i += 2;
+                if want_check {
+                    let (dmax, pmax) = (1..n - 1)
+                        .into_par_iter()
+                        .with_min_len(min_len)
+                        .map(|j| {
+                            let sp = ptr; // capture the whole Send/Sync wrapper
+                            let p = sp.0;
+                            let mut ld = 0.0f64;
+                            let mut lp = 1e-30f64;
+                            let mut i = 1 + ((j + color) & 1);
+                            while i < n - 1 {
+                                let c = idx(i, j, n);
+                                unsafe {
+                                    let sum = *p.add(c + 1)
+                                        + *p.add(c - 1)
+                                        + *p.add(c + n)
+                                        + *p.add(c - n);
+                                    let new = (sum + h2 * omega[c]) * 0.25;
+                                    let old = *p.add(c);
+                                    let dpsi = w * (new - old);
+                                    let val = old + dpsi;
+                                    *p.add(c) = val;
+                                    let ad = dpsi.abs();
+                                    if ad > ld {
+                                        ld = ad;
+                                    }
+                                    let ap = val.abs();
+                                    if ap > lp {
+                                        lp = ap;
+                                    }
+                                }
+                                i += 2;
+                            }
+                            (ld, lp)
+                        })
+                        .reduce(|| (0.0f64, 1e-30f64), |a, b| (a.0.max(b.0), a.1.max(b.1)));
+                    if dmax > max_dpsi {
+                        max_dpsi = dmax;
                     }
+                    if pmax > max_psi {
+                        max_psi = pmax;
+                    }
+                } else {
+                    // Bare update sweep: no per-cell tracking, no reduction.
+                    // SAFETY: red-black ordering makes the per-cell writes
+                    // disjoint and independent of opposite-colour reads.
+                    (1..n - 1).into_par_iter().with_min_len(min_len).for_each(|j| {
+                        let sp = ptr;
+                        let p = sp.0;
+                        let mut i = 1 + ((j + color) & 1);
+                        while i < n - 1 {
+                            let c = idx(i, j, n);
+                            unsafe {
+                                let sum = *p.add(c + 1)
+                                    + *p.add(c - 1)
+                                    + *p.add(c + n)
+                                    + *p.add(c - n);
+                                let new = (sum + h2 * omega[c]) * 0.25;
+                                let old = *p.add(c);
+                                *p.add(c) = old + w * (new - old);
+                            }
+                            i += 2;
+                        }
+                    });
                 }
             }
             it += 1;
-            rel = max_dpsi / max_psi;
-            if rel < self.cfg.poisson_tol {
-                break;
+            if want_check {
+                rel = max_dpsi / max_psi;
+                if rel < self.cfg.poisson_tol {
+                    break;
+                }
             }
         }
         (it, rel)
@@ -169,11 +473,16 @@ impl Solver {
     /// Assumes psi already solved and wall vorticity BC applied for `om`.
     fn rhs(&self, om: &[f64], rhs: &mut [f64]) {
         let n = self.n;
-        let h = self.h;
-        let h2 = h * h;
+        let h2 = self.h * self.h;
         let inv12h2 = 1.0 / (12.0 * h2);
+        let nu = self.nu;
         let p = &self.psi;
-        for j in 1..n - 1 {
+        // One row of output per rayon task; each row reads its neighbour rows
+        // of the (immutable) psi and omega fields.
+        rhs.par_chunks_mut(n).enumerate().for_each(|(j, row)| {
+            if j == 0 || j == n - 1 {
+                return;
+            }
             for i in 1..n - 1 {
                 let c = idx(i, j, n);
                 let e = idx(i + 1, j, n);
@@ -200,27 +509,32 @@ impl Solver {
                 let lap = (om[e] + om[we] + om[no] + om[so] - 4.0 * om[c]) / h2;
 
                 // dω/dt = -(u·∇)ω + ν∇²ω = J(ψ,ω) + ν∇²ω
-                rhs[c] = jac + self.nu * lap;
+                row[i] = jac + nu * lap;
             }
-        }
+        });
     }
 
     /// Maximum velocity magnitude (for CFL / adaptive dt).
     fn max_speed(&self) -> f64 {
         let n = self.n;
         let h = self.h;
-        let mut umax = self.cfg.u_lid; // lid guarantees at least this
-        for j in 1..n - 1 {
-            for i in 1..n - 1 {
-                let u = (self.psi[idx(i, j + 1, n)] - self.psi[idx(i, j - 1, n)]) / (2.0 * h);
-                let v = -(self.psi[idx(i + 1, j, n)] - self.psi[idx(i - 1, j, n)]) / (2.0 * h);
-                let s = (u * u + v * v).sqrt();
-                if s > umax {
-                    umax = s;
+        let p = &self.psi;
+        let interior_max = (1..n - 1)
+            .into_par_iter()
+            .map(|j| {
+                let mut umax = 0.0f64;
+                for i in 1..n - 1 {
+                    let u = (p[idx(i, j + 1, n)] - p[idx(i, j - 1, n)]) / (2.0 * h);
+                    let v = -(p[idx(i + 1, j, n)] - p[idx(i - 1, j, n)]) / (2.0 * h);
+                    let s = (u * u + v * v).sqrt();
+                    if s > umax {
+                        umax = s;
+                    }
                 }
-            }
-        }
-        umax
+                umax
+            })
+            .reduce(|| 0.0f64, f64::max);
+        interior_max.max(self.cfg.u_lid) // lid guarantees at least this
     }
 
     /// One SSP-RK3 step. Returns (poisson_iters_total, poisson_res_last).
@@ -229,55 +543,60 @@ impl Solver {
         let size = n * n;
         let mut k = vec![0.0f64; size];
         let mut it_total = 0;
-        let mut res_last;
 
         // Stage 1
-        let (it, r) = self.poisson();
+        let (it, _r) = self.poisson();
         self.apply_vorticity_bc();
         it_total += it;
-        res_last = r;
         let cur = self.omega.clone();
         self.rhs(&cur, &mut k);
         let omega0 = cur;
         let mut omega1 = omega0.clone();
-        for j in 1..n - 1 {
+        omega1.par_chunks_mut(n).enumerate().for_each(|(j, row)| {
+            if j == 0 || j == n - 1 {
+                return;
+            }
             for i in 1..n - 1 {
                 let c = idx(i, j, n);
-                omega1[c] = omega0[c] + dt * k[c];
+                row[i] = omega0[c] + dt * k[c];
             }
-        }
+        });
 
         // Stage 2
         self.omega = omega1;
-        let (it, r) = self.poisson();
+        let (it, _r) = self.poisson();
         self.apply_vorticity_bc();
         it_total += it;
-        res_last = r;
         let cur = self.omega.clone();
         self.rhs(&cur, &mut k);
         let mut omega2 = cur.clone();
-        for j in 1..n - 1 {
+        omega2.par_chunks_mut(n).enumerate().for_each(|(j, row)| {
+            if j == 0 || j == n - 1 {
+                return;
+            }
             for i in 1..n - 1 {
                 let c = idx(i, j, n);
-                omega2[c] = 0.75 * omega0[c] + 0.25 * (cur[c] + dt * k[c]);
+                row[i] = 0.75 * omega0[c] + 0.25 * (cur[c] + dt * k[c]);
             }
-        }
+        });
 
         // Stage 3
         self.omega = omega2;
-        let (it, r) = self.poisson();
+        let (it, res_last) = self.poisson();
         self.apply_vorticity_bc();
         it_total += it;
-        res_last = r;
         let cur = self.omega.clone();
         self.rhs(&cur, &mut k);
         let mut omega_new = cur.clone();
-        for j in 1..n - 1 {
+        omega_new.par_chunks_mut(n).enumerate().for_each(|(j, row)| {
+            if j == 0 || j == n - 1 {
+                return;
+            }
             for i in 1..n - 1 {
                 let c = idx(i, j, n);
-                omega_new[c] = (1.0 / 3.0) * omega0[c] + (2.0 / 3.0) * (cur[c] + dt * k[c]);
+                row[i] = (1.0 / 3.0) * omega0[c] + (2.0 / 3.0) * (cur[c] + dt * k[c]);
             }
-        }
+        });
         self.omega = omega_new;
 
         (it_total, res_last)
@@ -288,25 +607,33 @@ impl Solver {
         let n = self.n;
         let h = self.h;
         let da = h * h;
-        let mut ke = 0.0;
-        let mut ens = 0.0;
-        let mut circ = 0.0;
-        let mut umax = 0.0f64;
-        for j in 1..n - 1 {
-            for i in 1..n - 1 {
-                let c = idx(i, j, n);
-                let u = (self.psi[idx(i, j + 1, n)] - self.psi[idx(i, j - 1, n)]) / (2.0 * h);
-                let v = -(self.psi[idx(i + 1, j, n)] - self.psi[idx(i - 1, j, n)]) / (2.0 * h);
-                ke += 0.5 * (u * u + v * v) * da;
-                ens += 0.5 * self.omega[c] * self.omega[c] * da;
-                circ += self.omega[c] * da;
-                let s = (u * u + v * v).sqrt();
-                if s > umax {
-                    umax = s;
+        let p = &self.psi;
+        let om = &self.omega;
+        (1..n - 1)
+            .into_par_iter()
+            .map(|j| {
+                let mut ke = 0.0;
+                let mut ens = 0.0;
+                let mut circ = 0.0;
+                let mut umax = 0.0f64;
+                for i in 1..n - 1 {
+                    let c = idx(i, j, n);
+                    let u = (p[idx(i, j + 1, n)] - p[idx(i, j - 1, n)]) / (2.0 * h);
+                    let v = -(p[idx(i + 1, j, n)] - p[idx(i - 1, j, n)]) / (2.0 * h);
+                    ke += 0.5 * (u * u + v * v) * da;
+                    ens += 0.5 * om[c] * om[c] * da;
+                    circ += om[c] * da;
+                    let s = (u * u + v * v).sqrt();
+                    if s > umax {
+                        umax = s;
+                    }
                 }
-            }
-        }
-        (ke, ens, circ, umax)
+                (ke, ens, circ, umax)
+            })
+            .reduce(
+                || (0.0, 0.0, 0.0, 0.0),
+                |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3.max(b.3)),
+            )
     }
 
     /// Write current fields (omega, psi, u, v) as raw little-endian f64.
@@ -385,6 +712,16 @@ fn parse_args(cfg: &mut Config) {
                     cfg.out_every = v;
                 }
             }
+            "--threads" => {
+                if let Some(v) = num!() {
+                    cfg.threads = v;
+                }
+            }
+            "--solver" => {
+                if let Some(v) = val {
+                    cfg.solver = v.clone();
+                }
+            }
             "--outdir" => {
                 if let Some(v) = val {
                     cfg.outdir = v.clone();
@@ -400,8 +737,22 @@ fn main() {
     let mut cfg = Config::default();
     parse_args(&mut cfg);
 
+    // Configure the rayon thread pool. threads == 0 -> use all logical cores.
+    if cfg.threads > 0 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(cfg.threads)
+            .build_global()
+            .expect("build rayon pool");
+    }
+    let nthreads = rayon::current_num_threads();
+
     let mut solver = Solver::new(cfg.clone());
     let n = solver.n;
+    let solver_name = if solver.fft_poisson.is_some() {
+        "FFT/DST (direct)"
+    } else {
+        "SOR (iterative)"
+    };
 
     fs::create_dir_all(&cfg.outdir).expect("mkdir outdir");
     let fields_dir = format!("{}/fields", cfg.outdir);
@@ -417,6 +768,7 @@ fn main() {
         writeln!(m, "u_lid={}", cfg.u_lid).unwrap();
         writeln!(m, "t_end={}", cfg.t_end).unwrap();
         writeln!(m, "cfl={}", cfg.cfl).unwrap();
+        writeln!(m, "solver={}", solver_name).unwrap();
     }
 
     let mut diag = BufWriter::new(File::create(format!("{}/diagnostics.csv", cfg.outdir)).unwrap());
@@ -428,8 +780,9 @@ fn main() {
 
     println!(
         "2D incompressible Euler (vorticity-streamfunction) | lid-driven cavity\n\
-         grid = {n}x{n}, Re = {}, nu = {:.3e}, t_end = {}, CFL = {}",
-        cfg.re, solver.nu, cfg.t_end, cfg.cfl
+         grid = {n}x{n}, Re = {}, nu = {:.3e}, t_end = {}, CFL = {}, threads = {}\n\
+         Poisson solver: {}",
+        cfg.re, solver.nu, cfg.t_end, cfg.cfl, nthreads, solver_name
     );
 
     let start = Instant::now();
