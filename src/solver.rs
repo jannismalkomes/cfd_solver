@@ -5,24 +5,25 @@
 //! Advection: Arakawa Jacobian (energy/enstrophy conserving). Time: SSP-RK3.
 //! Poisson: FFT/DST (cavity) or red-black SOR. Two scenarios:
 //!
-//!   * `cavity`   — square lid-driven cavity, ψ = 0 on all walls, Thom wall
-//!                  vorticity, top lid moving. High-Re "Euler limit".
-//!   * `cylinder` — channel with an immersed circular cylinder: uniform inflow,
-//!                  Neumann outflow, free-slip channel walls, no-slip cylinder
-//!                  (staircase mask + Thom). Moderate Re_D → Kármán vortex street
-//!                  (a viscous, Navier-Stokes phenomenon).
+//!   * `cavity`     — square lid-driven cavity, ψ = 0 on all walls, Thom wall
+//!                    vorticity, top lid moving. High-Re "Euler limit".
+//!   * `windtunnel` — channel with an immersed object (cylinder or NACA airfoil):
+//!                    uniform inflow, Neumann outflow, free-slip channel walls,
+//!                    no-slip body (staircase mask + Thom). Moderate Re → wake /
+//!                    Kármán vortex street (a viscous, Navier-Stokes phenomenon).
 
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
 use crate::config::Config;
+use crate::geometry::Object;
 use crate::poisson::PoissonFft;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Scenario {
     Cavity,
-    Cylinder,
+    WindTunnel,
 }
 
 #[derive(Copy, Clone)]
@@ -51,6 +52,7 @@ pub struct Solver {
     psi_fixed: Vec<bool>, // Dirichlet ψ (walls / inflow / solid)
     psi_val: Vec<f64>,    // fixed ψ values where psi_fixed
     outflow: bool,        // right column is Neumann outflow
+    object_desc: String,  // human-readable object description (windtunnel)
     sor: f64,
     min_len: usize,
     fft_poisson: Option<PoissonFft>,
@@ -58,13 +60,9 @@ pub struct Solver {
 
 impl Solver {
     pub fn new(cfg: Config) -> Self {
-        let scenario = match cfg.scenario.as_str() {
-            "cylinder" => Scenario::Cylinder,
-            _ => Scenario::Cavity,
-        };
-        match scenario {
-            Scenario::Cavity => Self::new_cavity(cfg),
-            Scenario::Cylinder => Self::new_cylinder(cfg),
+        match cfg.scenario.as_str() {
+            "windtunnel" | "cylinder" => Self::new_windtunnel(cfg),
+            _ => Self::new_cavity(cfg),
         }
     }
 
@@ -94,6 +92,7 @@ impl Solver {
             psi_fixed: vec![false; nx * ny],
             psi_val: vec![0.0; nx * ny],
             outflow: false,
+            object_desc: String::new(),
             sor,
             min_len,
             fft_poisson: None,
@@ -130,7 +129,7 @@ impl Solver {
         s
     }
 
-    fn new_cylinder(cfg: Config) -> Solver {
+    fn new_windtunnel(cfg: Config) -> Solver {
         // Channel of height ly=cfg.l, length lx = aspect·ly.
         let ny = cfg.n;
         let ly = cfg.l;
@@ -139,47 +138,49 @@ impl Solver {
         let nx = ((aspect * (ny as f64 - 1.0)).round() as usize) + 1;
         let lx = (nx as f64 - 1.0) * h;
         let u_in = cfg.u_lid;
-        let d = 0.2 * ly; // cylinder diameter
-        let nu = u_in * d / cfg.re; // Re based on diameter
-        let mut s = Self::common(cfg.clone(), Scenario::Cylinder, nx, ny, lx, ly, h, nu, u_in);
-        s.outflow = true;
 
-        let r = 0.5 * d;
-        let xc = 1.0 * ly; // ~5 diameters downstream of the inlet
-        let yc = 0.5 * ly + 0.5 * h; // half-cell offset breaks the symmetry
-        let psi_cyl = u_in * 0.5 * ly; // centreline streamfunction value
+        let object = Object::from_config(&cfg, ly, h);
+        let nu = u_in * object.char_length() / cfg.re; // Re based on char. length
+        let object_desc = object.describe();
+        let mut s = Self::common(cfg.clone(), Scenario::WindTunnel, nx, ny, lx, ly, h, nu, u_in);
+        s.outflow = true;
+        s.object_desc = object_desc;
+
+        // ψ carried by the body (≈ U·y at the body centre).
+        let psi_body = u_in * object.y_ref();
 
         for j in 0..ny {
             let y = j as f64 * h;
             for i in 0..nx {
                 let x = i as f64 * h;
                 let c = idx(i, j, nx);
-                // immersed solid cylinder
-                if (x - xc) * (x - xc) + (y - yc) * (y - yc) <= r * r {
+                if object.contains(x, y) {
                     s.solid[c] = true;
                     s.psi_fixed[c] = true;
-                    s.psi_val[c] = psi_cyl;
+                    s.psi_val[c] = psi_body;
                 }
-                // inflow (left): uniform u = U -> ψ = U·y
                 if i == 0 {
+                    // inflow: uniform u = U -> ψ = U·y
                     s.psi_fixed[c] = true;
                     s.psi_val[c] = u_in * y;
                 }
-                // channel walls (bottom ψ=0, top ψ=U·ly) — streamlines (free-slip)
                 if j == 0 {
+                    // bottom wall streamline (free-slip)
                     s.psi_fixed[c] = true;
                     s.psi_val[c] = 0.0;
                 }
                 if j == ny - 1 {
+                    // top wall streamline (free-slip)
                     s.psi_fixed[c] = true;
                     s.psi_val[c] = u_in * ly;
                 }
-                // right column is Neumann outflow — left free (handled in SOR)
+                // right column is Neumann outflow — handled in SOR
             }
         }
 
         // Seed a small antisymmetric perturbation in the near wake to trigger
         // shedding sooner (it would eventually grow from round-off anyway).
+        let (wx, wy, wlen) = object.wake_anchor();
         let amp = 3.0;
         for j in 1..ny - 1 {
             let y = j as f64 * h;
@@ -189,9 +190,9 @@ impl Solver {
                 if s.solid[c] {
                     continue;
                 }
-                if x > xc && x < xc + 2.0 * d && (y - yc).abs() < d {
-                    let sx = ((x - xc) / (2.0 * d)).min(1.0);
-                    s.omega[c] = amp * (std::f64::consts::PI * sx).sin() * (y - yc) / d;
+                if x > wx && x < wx + 2.0 * wlen && (y - wy).abs() < wlen {
+                    let sx = ((x - wx) / (2.0 * wlen)).min(1.0);
+                    s.omega[c] = amp * (std::f64::consts::PI * sx).sin() * (y - wy) / wlen;
                 }
             }
         }
@@ -201,8 +202,13 @@ impl Solver {
     pub fn scenario_name(&self) -> &'static str {
         match self.scenario {
             Scenario::Cavity => "cavity",
-            Scenario::Cylinder => "cylinder",
+            Scenario::WindTunnel => "windtunnel",
         }
+    }
+
+    /// Description of the wind-tunnel object (empty for the cavity).
+    pub fn object_desc(&self) -> &str {
+        &self.object_desc
     }
 
     pub fn solver_name(&self) -> &'static str {
@@ -343,7 +349,7 @@ impl Solver {
     pub fn apply_vorticity_bc(&mut self) {
         match self.scenario {
             Scenario::Cavity => self.bc_cavity(),
-            Scenario::Cylinder => self.bc_cylinder(),
+            Scenario::WindTunnel => self.bc_windtunnel(),
         }
     }
 
@@ -362,7 +368,7 @@ impl Solver {
         }
     }
 
-    fn bc_cylinder(&mut self) {
+    fn bc_windtunnel(&mut self) {
         let (nx, ny) = (self.nx, self.ny);
         let h2 = self.h * self.h;
         // inflow (irrotational) and free-slip channel walls: ω = 0
@@ -584,7 +590,7 @@ impl Solver {
                     uu[idx(i, ny - 1, nx)] = self.u_in; // moving lid
                 }
             }
-            Scenario::Cylinder => {
+            Scenario::WindTunnel => {
                 for j in 0..ny {
                     uu[idx(0, j, nx)] = self.u_in; // inflow
                 }

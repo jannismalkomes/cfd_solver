@@ -5,6 +5,7 @@
 //! rendered natively in Rust into `<outdir>/figures/`.
 
 mod config;
+mod geometry;
 mod poisson;
 mod solver;
 mod viz;
@@ -53,6 +54,9 @@ fn main() {
         writeln!(m, "t_end={}", cfg.t_end).unwrap();
         writeln!(m, "cfl={}", cfg.cfl).unwrap();
         writeln!(m, "solver={}", solver_name).unwrap();
+        if !solver.object_desc().is_empty() {
+            writeln!(m, "object={}", solver.object_desc()).unwrap();
+        }
     }
     // Solid mask (cylinder scenario) for the visualiser to overlay the obstacle.
     if solver.has_solid() {
@@ -68,11 +72,16 @@ fn main() {
     )
     .unwrap();
 
+    let obj_line = if solver.object_desc().is_empty() {
+        String::new()
+    } else {
+        format!("\nobject: {}", solver.object_desc())
+    };
     println!(
         "2D incompressible vorticity-streamfunction | scenario: {}\n\
          grid = {nx}x{ny}, Re = {}, nu = {:.3e}, t_end = {}, CFL = {}, threads = {}\n\
-         Poisson solver: {}",
-        solver.scenario_name(), cfg.re, solver.nu, cfg.t_end, cfg.cfl, nthreads, solver_name
+         Poisson solver: {}{}",
+        solver.scenario_name(), cfg.re, solver.nu, cfg.t_end, cfg.cfl, nthreads, solver_name, obj_line
     );
 
     let start = Instant::now();

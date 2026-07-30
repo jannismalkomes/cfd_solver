@@ -1,12 +1,12 @@
-# 2D incompressible flow solver — cavity & vortex street
+# 2D incompressible flow solver — cavity & wind tunnel
 
 A from-scratch Rust solver for the **2D incompressible vorticity-transport
 equations** in vorticity–streamfunction form. Two scenarios (`--scenario`):
 
 - **`cavity`** (default) — the classic **lid-driven cavity** in the high-Reynolds
   "Euler limit".
-- **`cylinder`** — flow past a circular cylinder in a channel, producing a
-  **Kármán vortex street**.
+- **`windtunnel`** — a channel with an immersed object (a **cylinder** → Kármán
+  vortex street, or a **NACA airfoil** with adjustable angle of attack).
 
 The solver's only crate dependency is [rayon](https://crates.io/crates/rayon) for
 multithreading; figures are produced by a bundled Python script that the binary
@@ -14,24 +14,32 @@ invokes automatically after a run.
 
 ## Scenarios
 
-| | `cavity` | `cylinder` |
-|---|----------|------------|
+| | `cavity` | `windtunnel` |
+|---|----------|--------------|
 | domain | square `1×1` | channel `4×1` |
 | grid | `n×n` (FFT-friendly `n = 2^k+1`) | `nx×ny`, `ny = --n` |
 | driving | moving top lid | uniform inflow |
 | walls | no-slip (Thom) | free-slip channel + Neumann outflow |
-| obstacle | — | immersed no-slip cylinder (staircase mask) |
+| obstacle | — | immersed no-slip **cylinder** or **NACA airfoil** (staircase mask) |
 | Poisson | FFT/DST (direct) | SOR (masked domain) |
-| regime | high-Re "Euler limit" | moderate `Re_D ≈ 150` |
+| regime | high-Re "Euler limit" | moderate `Re ≈ 100–600` |
 
-**On physics:** a Kármán vortex street is a *viscous* (Navier–Stokes) phenomenon —
-shedding is driven by boundary-layer separation, so the cylinder case runs at a
-moderate diameter-Reynolds number (`Re_D = U·D/ν`, default 150), not the inviscid
-limit. A tiny cylinder offset + wake seed break the symmetry to start shedding.
+**On physics:** vortex shedding / wakes are *viscous* (Navier–Stokes) phenomena
+driven by boundary-layer separation, so the wind-tunnel runs at a moderate
+Reynolds number (`Re = U·L_char/ν`, `L_char` = diameter or chord), not the
+inviscid limit. A tiny object offset + wake seed break the symmetry to start
+shedding. (`cylinder` is accepted as an alias for `--scenario windtunnel`.)
+
+The immersed body is a streamline (`ψ = U·y_centre`); the Kutta condition is not
+enforced, so airfoil **circulation/lift is not exact** — the figures show the
+wake and separation structure, not accurate aerodynamic loads.
 
 ```bash
-./target/release/cfd_solver --scenario cylinder            # defaults: 257×65, Re_D=150
-./target/release/cfd_solver --scenario cylinder --n 97 --re 200 --tend 100
+# cylinder → Kármán vortex street
+./target/release/cfd_solver --scenario windtunnel                       # 257×65, Re=150
+# NACA 2412 airfoil at 12° angle of attack
+./target/release/cfd_solver --scenario windtunnel --object naca \
+    --naca 2412 --aoa 12 --re 500 --n 97
 ```
 
 ### Source layout
@@ -106,10 +114,10 @@ available via `--solver`:
 
 ```bash
 cargo build --release
-./target/release/cfd_solver                        # defaults: 129², Re=5000, t=30
+./target/release/cfd_solver                        # cavity: 129², Re=5000, t=30
 ./target/release/cfd_solver --n 257 --re 10000 --tend 40 --cfl 0.4
-./target/release/cfd_solver --n 513 --threads 4    # use 4 cores
-./target/release/cfd_solver --n 200 --solver sor   # non-2^k+1 grid -> SOR
+./target/release/cfd_solver --scenario windtunnel  # cylinder → vortex street
+./target/release/cfd_solver --scenario windtunnel --object naca --naca 0015 --aoa 6
 ./target/release/cfd_solver --view show            # also display figures interactively
 ```
 
@@ -117,22 +125,43 @@ Simulation runs, then figures are generated automatically (via `src/python_helpe
 
 ## Command-line options
 
-All flags are optional; each takes one value (`--flag value`).
+All flags are optional; each takes one value (`--flag value`). Scenario-specific
+defaults are applied only to flags you don't pass, so every one is overridable.
+
+### General parameters
 
 | Flag | Values | Default | Description |
 |------|--------|---------|-------------|
-| `--scenario` | `cavity` \| `cylinder` | `cavity` | Simulation setup (see [Scenarios](#scenarios)). Sets scenario-appropriate defaults for unset flags. |
-| `--n` | integer | `129` (cavity), `65` (cylinder) | Transverse resolution. Cavity: square `n×n` (FFT wants `n = 2^k+1`). Cylinder: channel-height nodes `ny` (width follows the 4:1 aspect). |
-| `--re` | float | `5000` (cavity), `150` (cylinder) | Reynolds number. Cavity: `ν = U·L/Re` (large → Euler limit). Cylinder: diameter-based `Re_D = U·D/ν`. |
-| `--tend` | float | `30` (cavity), `60` (cylinder) | Final simulation time. |
+| `--scenario` | `cavity` \| `windtunnel` | `cavity` | Simulation setup (see [Scenarios](#scenarios)). `cylinder` is an alias for `windtunnel`. |
+| `--n` | integer | `129` (cavity), `65` (windtunnel) | Transverse resolution. Cavity: square `n×n` (FFT wants `n = 2^k+1`). Wind tunnel: channel-height nodes `ny` (width follows the 4:1 aspect). |
+| `--re` | float | `5000` (cavity), `150` (windtunnel) | Reynolds number. Cavity: `ν = U·L/Re`. Wind tunnel: `ν = U·L_char/Re` (`L_char` = cylinder diameter or airfoil chord). |
+| `--tend` | float | `30` (cavity), `60` (windtunnel) | Final simulation time. |
 | `--cfl` | float | `0.4` | Target CFL number for the adaptive time step. |
-| `--out-every` | float | `0.25` (cavity), `0.5` (cylinder) | Simulation-time interval between saved field snapshots (frames). |
+| `--out-every` | float | `0.25` (cavity), `0.5` (windtunnel) | Interval (sim time) between saved field snapshots (frames). |
 | `--threads` | integer | `0` | Worker threads. `0` = all logical cores. Results are identical regardless of value. |
 | `--solver` | `auto` \| `fft` \| `sor` | `auto` | Poisson solver. `auto` picks `fft` when `n−1` is a power of two, else `sor`. |
-| `--view` | `none` \| `save` \| `show` | `save` | Visualisation: `save` writes figures to `<outdir>/figures/`; `show` also displays them; `none` skips it. |
+| `--view` | `none` \| `save` \| `show` | `save` | Visualisation: `save` writes figures; `show` also displays them; `none` skips it. |
 | `--outdir` | path | `output` | Output directory for data (`meta.txt`, `diagnostics.csv`, `fields/`) and figures. |
 
-Example: `./target/release/cfd_solver --n 257 --re 10000 --tend 40 --threads 4 --view none`
+### Wind-tunnel object (`--scenario windtunnel`)
+
+| Flag | Values | Default | Description |
+|------|--------|---------|-------------|
+| `--object` | `cylinder` \| `naca` | `cylinder` | Which body to place in the channel. |
+| `--obj-x` | float | `1.0` | Streamwise position: cylinder centre / airfoil leading edge. |
+| `--obj-y` | float | mid-channel | Transverse position of the object. Omit for centred (with a half-cell offset to break symmetry). |
+| `--diam` | float | `0.2` | Cylinder diameter (`--object cylinder`). |
+| `--chord` | float | `0.5` | Airfoil chord length (`--object naca`). |
+| `--aoa` | float (deg) | `0` | Angle of attack, positive = nose up (`--object naca`). |
+
+### NACA airfoil (`--object naca`)
+
+| Flag | Values | Default | Description |
+|------|--------|---------|-------------|
+| `--naca` | 4-digit code | `0012` | NACA 4-digit designation `MPTT`: `M` = max camber (% chord), `P` = camber position (tenths of chord), `TT` = max thickness (% chord). E.g. `2412` = 2% camber at 0.4c, 12% thick; `0015` = symmetric, 15% thick. |
+
+Example (cavity): `./target/release/cfd_solver --n 257 --re 10000 --tend 40 --threads 4 --view none`
+Example (airfoil): `./target/release/cfd_solver --scenario windtunnel --object naca --naca 4412 --aoa 10 --re 600 --n 129`
 
 ## Visualisation (`--view`)
 

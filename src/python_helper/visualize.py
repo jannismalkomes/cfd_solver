@@ -78,6 +78,7 @@ def read_meta():
         if k in meta:
             meta[k] = float(meta[k])
     meta.setdefault("scenario", "cavity")
+    meta.setdefault("object", "object")
     return meta
 
 
@@ -196,8 +197,8 @@ def cylinder_figs(meta, frames):
     tfin = ft.get(len(frames) - 1, 0)
 
     fig, ax = plt.subplots(3, 1, figsize=(13, 10.2))
-    fig.suptitle(f"Flow past a cylinder — Kármán vortex street  "
-                 f"(Re_D = {meta['Re']:.0f}, {nx}×{ny}, t = {tfin:.0f})",
+    fig.suptitle(f"Wind tunnel — {meta['object']}   "
+                 f"(Re = {meta['Re']:.0f}, {nx}×{ny}, t = {tfin:.0f})",
                  fontsize=13, fontweight="bold", y=0.995)
 
     # (a) Vorticity
@@ -253,7 +254,7 @@ def cylinder_evolution(meta, frames):
     # last 6 frames show the developed street
     idx = np.linspace(max(0, len(frames) - 11), len(frames) - 1, 6).astype(int)
     fig, axes = plt.subplots(6, 1, figsize=(12, 12))
-    fig.suptitle("Vorticity evolution — vortex shedding", fontsize=13, fontweight="bold")
+    fig.suptitle(f"Vorticity evolution — {meta['object']}", fontsize=13, fontweight="bold")
     for ax_, fi in zip(axes, idx):
         om, *_ = load_frame(frames[fi], nx, ny)
         ax_.imshow(om, origin="lower", extent=ext, cmap="RdBu_r",
@@ -344,7 +345,7 @@ def main():
         return
     print(f"loaded {len(frames)} frames, scenario={meta['scenario']}, "
           f"{meta['nx']}×{meta['ny']}, Re={meta.get('Re', 0):.0f}")
-    if meta["scenario"] == "cylinder":
+    if meta["scenario"] in ("windtunnel", "cylinder"):
         cylinder_figs(meta, frames)
         cylinder_evolution(meta, frames)
     else:
