@@ -12,6 +12,7 @@ pub struct Config {
     pub out_every: f64,   // time between field snapshots
     pub poisson_tol: f64,
     pub poisson_max_it: usize,
+    pub sor_omega: f64, // SOR relaxation factor; NAN -> optimal (auto)
     pub threads: usize, // 0 = use all available cores
     pub solver: String, // "auto" | "fft" | "sor"
     pub view: String,   // "none" | "save" | "show"
@@ -38,8 +39,9 @@ impl Default for Config {
             t_end: 30.0,
             cfl: 0.4,
             out_every: 0.25,
-            poisson_tol: 1e-4,
+            poisson_tol: 2e-2, // relative residual max|∇²ψ+ω|/max|ω| for SOR
             poisson_max_it: 4000,
+            sor_omega: f64::NAN, // -> optimal factor for the grid
             threads: 0,
             solver: "auto".to_string(),
             view: "save".to_string(),
@@ -110,6 +112,11 @@ impl Config {
                 "--solver" => {
                     if let Some(v) = val {
                         cfg.solver = v.clone();
+                    }
+                }
+                "--relax" => {
+                    if let Some(v) = num!() {
+                        cfg.sor_omega = v;
                     }
                 }
                 "--view" => {

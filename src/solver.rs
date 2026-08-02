@@ -68,12 +68,16 @@ impl Solver {
 
     fn common(cfg: Config, scenario: Scenario, nx: usize, ny: usize, lx: f64, ly: f64,
               h: f64, nu: f64, u_in: f64) -> Solver {
-        // Optimal SOR factor for a rectangular grid: ω = 2/(1+√(1−ρ²)) with the
-        // Jacobi spectral radius ρ = ½(cos π/(nx−1) + cos π/(ny−1)). The square
-        // approximation over-relaxes badly on an elongated (channel) domain.
+        // SOR relaxation factor. Default = optimal for a rectangular grid:
+        // ω = 2/(1+√(1−ρ²)) with the Jacobi spectral radius
+        // ρ = ½(cos π/(nx−1) + cos π/(ny−1)). Overridable via --relax.
         let pi = std::f64::consts::PI;
         let rho = 0.5 * ((pi / (nx as f64 - 1.0)).cos() + (pi / (ny as f64 - 1.0)).cos());
-        let sor = 2.0 / (1.0 + (1.0 - rho * rho).sqrt());
+        let sor = if cfg.sor_omega.is_finite() {
+            cfg.sor_omega
+        } else {
+            2.0 / (1.0 + (1.0 - rho * rho).sqrt())
+        };
         let nthreads = rayon::current_num_threads().max(1);
         let min_len = (ny / nthreads).max(1);
         Solver {
@@ -178,10 +182,12 @@ impl Solver {
             }
         }
 
-        // Seed a small antisymmetric perturbation in the near wake to trigger
-        // shedding sooner (it would eventually grow from round-off anyway).
+        // Seed a tiny antisymmetric perturbation in the near wake to break the
+        // symmetry and start shedding. It is kept small enough to be invisible
+        // (well under 1% of the developed vorticity) — the wake instability
+        // amplifies it; it would otherwise grow from round-off, but far slower.
         let (wx, wy, wlen) = object.wake_anchor();
-        let amp = 3.0;
+        let amp = 0.1;
         for j in 1..ny - 1 {
             let y = j as f64 * h;
             for i in 1..nx - 1 {
@@ -209,6 +215,11 @@ impl Solver {
     /// Description of the wind-tunnel object (empty for the cavity).
     pub fn object_desc(&self) -> &str {
         &self.object_desc
+    }
+
+    /// The SOR relaxation factor in use (relevant only for the SOR solver).
+    pub fn omega(&self) -> f64 {
+        self.sor
     }
 
     pub fn solver_name(&self) -> &'static str {
@@ -270,7 +281,7 @@ impl Solver {
         let outflow = self.outflow;
         let check = 4usize;
         let mut it = 0;
-        let mut rel = 0.0;
+        let mut abs_res = 0.0; // final absolute max residual (for diagnostics)
         while it < self.cfg.poisson_max_it {
             // Neumann outflow: copy the last interior column into the right wall.
             if outflow {
@@ -278,15 +289,11 @@ impl Solver {
                     self.psi[idx(nx - 1, j, nx)] = self.psi[idx(nx - 2, j, nx)];
                 }
             }
-            let want_check = (it + 1) % check == 0;
-            let mut max_dpsi = 0.0f64;
-            let mut max_psi = 1e-30f64;
+            // Red-black SOR update sweeps (no per-cell tracking).
             for color in 0..2 {
-                let sweep = |j: usize| -> (f64, f64) {
-                    let sp = ptr;
+                (1..ny - 1).into_par_iter().with_min_len(min_len).for_each(|j| {
+                    let sp = ptr; // capture the whole Send/Sync wrapper
                     let p = sp.0;
-                    let mut ld = 0.0f64;
-                    let mut lp = 1e-30f64;
                     let mut i = 1 + ((j + color) & 1);
                     while i < nx - 1 {
                         let c = idx(i, j, nx);
@@ -298,41 +305,58 @@ impl Solver {
                                     + *p.add(c - nx);
                                 let new = (sum + h2 * omega[c]) * 0.25;
                                 let old = *p.add(c);
-                                let dpsi = w * (new - old);
-                                let val = old + dpsi;
-                                *p.add(c) = val;
-                                let ad = dpsi.abs();
-                                if ad > ld {
-                                    ld = ad;
-                                }
-                                let ap = val.abs();
-                                if ap > lp {
-                                    lp = ap;
-                                }
+                                *p.add(c) = old + w * (new - old);
                             }
                         }
                         i += 2;
                     }
-                    (ld, lp)
-                };
-                if want_check {
-                    let (dmax, pmax) = (1..ny - 1)
-                        .into_par_iter()
-                        .with_min_len(min_len)
-                        .map(sweep)
-                        .reduce(|| (0.0f64, 1e-30f64), |a, b| (a.0.max(b.0), a.1.max(b.1)));
-                    max_dpsi = max_dpsi.max(dmax);
-                    max_psi = max_psi.max(pmax);
-                } else {
-                    (1..ny - 1).into_par_iter().with_min_len(min_len).for_each(|j| {
-                        sweep(j);
-                    });
-                }
+                });
             }
             it += 1;
-            if want_check {
-                rel = max_dpsi / max_psi;
-                if rel < self.cfg.poisson_tol {
+
+            // Convergence on the RELATIVE RESIDUAL max|∇²ψ+ω| / max|ω|, which is
+            // a true measure of how well the equation is satisfied — independent
+            // of the relaxation factor and of the convergence rate. (A change-per-
+            // sweep test would falsely "converge" for small ω or slow ρ.)
+            if it % check == 0 {
+                if outflow {
+                    for j in 0..ny {
+                        self.psi[idx(nx - 1, j, nx)] = self.psi[idx(nx - 2, j, nx)];
+                    }
+                }
+                let (max_res, max_om) = (1..ny - 1)
+                    .into_par_iter()
+                    .with_min_len(min_len)
+                    .map(|j| {
+                        let sp = ptr; // capture the whole Send/Sync wrapper
+                        let p = sp.0;
+                        let mut mr = 0.0f64;
+                        let mut mo = 0.0f64;
+                        for i in 1..nx - 1 {
+                            let c = idx(i, j, nx);
+                            if psi_fixed[c] {
+                                continue;
+                            }
+                            unsafe {
+                                let lap = (*p.add(c + 1) + *p.add(c - 1) + *p.add(c + nx)
+                                    + *p.add(c - nx)
+                                    - 4.0 * *p.add(c))
+                                    / h2;
+                                let r = (lap + omega[c]).abs();
+                                if r > mr {
+                                    mr = r;
+                                }
+                            }
+                            let ao = omega[c].abs();
+                            if ao > mo {
+                                mo = ao;
+                            }
+                        }
+                        (mr, mo)
+                    })
+                    .reduce(|| (0.0f64, 0.0f64), |a, b| (a.0.max(b.0), a.1.max(b.1)));
+                abs_res = max_res;
+                if max_res / max_om.max(1e-30) < self.cfg.poisson_tol {
                     break;
                 }
             }
@@ -342,7 +366,7 @@ impl Solver {
                 self.psi[idx(nx - 1, j, nx)] = self.psi[idx(nx - 2, j, nx)];
             }
         }
-        (it, rel)
+        (it, abs_res)
     }
 
     /// Wall / obstacle vorticity boundary conditions given the current ψ.

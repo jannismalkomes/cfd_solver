@@ -297,6 +297,70 @@ def fig_solver(meta):
     _save(fig, "solver_behavior.png")
 
 
+def _rolling(a, w):
+    if len(a) < 3 or w < 2:
+        return a
+    w = min(w, len(a))
+    k = np.ones(w) / w
+    return np.convolve(a, k, mode="same")
+
+
+def fig_performance(meta):
+    """Solver performance metrics vs simulation time."""
+    d = load_diag()
+    names = d.dtype.names
+    t = d["time"]
+    m = d["step"] > 0
+    tt = t[m]
+
+    fig, ax = plt.subplots(2, 2, figsize=(12, 7.4))
+    om = meta.get("sor_omega")
+    subtitle = f"   (SOR ω = {float(om):.4f})" if om else ""
+    fig.suptitle(f"Solver performance — {meta.get('object') or meta['scenario']}{subtitle}",
+                 fontsize=13, fontweight="bold", y=0.98)
+    for a in ax.ravel():
+        a.grid(True, color=GRID, lw=0.8)
+        a.set_xlabel("time")
+
+    have_ms = "step_ms" in names
+    ms = d["step_ms"][m] if have_ms else np.full(tt.shape, np.nan)
+    sps = np.where(ms > 0, 1000.0 / ms, np.nan)
+
+    # (a) throughput (steps/s), raw + rolling mean
+    a = ax[0, 0]
+    if have_ms:
+        a.plot(tt, sps, color=GRID, lw=0.8)
+        a.plot(tt, _rolling(sps, 25), color=ACCENT, lw=2)
+        a.set_ylim(bottom=0)
+    a.set_title("(a) Throughput (steps/s)", loc="left", fontweight="bold")
+    a.set_ylabel("steps / s")
+
+    # (b) Poisson iterations per step (direct measure of SOR work / ω effect)
+    a = ax[0, 1]
+    a.plot(tt, d["poisson_iters"][m], color=ACCENT, lw=1.4)
+    a.set_title("(b) Poisson iterations / step", loc="left", fontweight="bold")
+    a.set_ylabel("iterations"); a.set_ylim(bottom=0)
+
+    # (c) wall time per step
+    a = ax[1, 0]
+    if have_ms:
+        a.plot(tt, ms, color=GRID, lw=0.8)
+        a.plot(tt, _rolling(ms, 25), color=ACCENT, lw=2)
+        a.set_ylim(bottom=0)
+    a.set_title("(c) Wall time / step (ms)", loc="left", fontweight="bold")
+    a.set_ylabel("ms / step")
+
+    # (d) cumulative wall-clock time
+    a = ax[1, 1]
+    if have_ms:
+        a.plot(tt, np.cumsum(ms) / 1000.0, color=ACCENT, lw=2)
+    a.set_title("(d) Cumulative wall time", loc="left", fontweight="bold")
+    a.set_ylabel("seconds")
+
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    _save(fig, "performance.png")
+
+
 def make_gif(meta, frames):
     nx, ny, Lx, Ly = meta["nx"], meta["ny"], meta["Lx"], meta["Ly"]
     mask = load_mask(nx, ny)
@@ -352,6 +416,7 @@ def main():
         cavity_figs(meta, frames)
         cavity_evolution(meta, frames)
     fig_solver(meta)
+    fig_performance(meta)
     try:
         make_gif(meta, frames)
     except Exception as e:

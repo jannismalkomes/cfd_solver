@@ -57,6 +57,9 @@ fn main() {
         if !solver.object_desc().is_empty() {
             writeln!(m, "object={}", solver.object_desc()).unwrap();
         }
+        if solver.solver_name().starts_with("SOR") {
+            writeln!(m, "sor_omega={}", solver.omega()).unwrap();
+        }
     }
     // Solid mask (cylinder scenario) for the visualiser to overlay the obstacle.
     if solver.has_solid() {
@@ -68,7 +71,7 @@ fn main() {
     let mut diag = BufWriter::new(File::create(format!("{}/diagnostics.csv", cfg.outdir)).unwrap());
     writeln!(
         diag,
-        "step,time,dt,cfl,max_speed,kinetic_energy,enstrophy,circulation,poisson_iters,poisson_residual,frame"
+        "step,time,dt,cfl,max_speed,kinetic_energy,enstrophy,circulation,poisson_iters,poisson_residual,step_ms,frame"
     )
     .unwrap();
 
@@ -77,11 +80,19 @@ fn main() {
     } else {
         format!("\nobject: {}", solver.object_desc())
     };
+    // Report the SOR relaxation factor (only meaningful for the SOR solver).
+    let relax_line = if solver.solver_name().starts_with("SOR") {
+        let src = if cfg.sor_omega.is_finite() { "user" } else { "auto-optimal" };
+        format!(" | SOR omega = {:.4} ({src})", solver.omega())
+    } else {
+        String::new()
+    };
     println!(
         "2D incompressible vorticity-streamfunction | scenario: {}\n\
          grid = {nx}x{ny}, Re = {}, nu = {:.3e}, t_end = {}, CFL = {}, threads = {}\n\
-         Poisson solver: {}{}",
-        solver.scenario_name(), cfg.re, solver.nu, cfg.t_end, cfg.cfl, nthreads, solver_name, obj_line
+         Poisson solver: {}{}{}",
+        solver.scenario_name(), cfg.re, solver.nu, cfg.t_end, cfg.cfl, nthreads,
+        solver_name, relax_line, obj_line
     );
 
     let start = Instant::now();
@@ -97,8 +108,8 @@ fn main() {
     let (ke, ens, circ, umax) = solver.diagnostics();
     writeln!(
         diag,
-        "{},{:.6},{:.3e},{:.4},{:.6},{:.8e},{:.8e},{:.8e},{},{:.3e},{}",
-        step, t, 0.0, 0.0, umax, ke, ens, circ, 0, 0.0, frame
+        "{},{:.6},{:.3e},{:.4},{:.6},{:.8e},{:.8e},{:.8e},{},{:.3e},{:.3},{}",
+        step, t, 0.0, 0.0, umax, ke, ens, circ, 0, 0.0, 0.0, frame
     )
     .unwrap();
     frame += 1;
@@ -123,7 +134,9 @@ fn main() {
         }
         let cfl_actual = umax * dt / solver.h;
 
+        let step_t0 = Instant::now();
         let (pit, pres) = solver.step(dt);
+        let step_ms = step_t0.elapsed().as_secs_f64() * 1000.0;
         t += dt;
         step += 1;
 
@@ -140,8 +153,8 @@ fn main() {
         let (ke, ens, circ, umx) = solver.diagnostics();
         writeln!(
             diag,
-            "{},{:.6},{:.3e},{:.4},{:.6},{:.8e},{:.8e},{:.8e},{},{:.3e},{}",
-            step, t, dt, cfl_actual, umx, ke, ens, circ, pit, pres, wrote_frame
+            "{},{:.6},{:.3e},{:.4},{:.6},{:.8e},{:.8e},{:.8e},{},{:.3e},{:.3},{}",
+            step, t, dt, cfl_actual, umx, ke, ens, circ, pit, pres, step_ms, wrote_frame
         )
         .unwrap();
 

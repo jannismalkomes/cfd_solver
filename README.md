@@ -140,6 +140,7 @@ defaults are applied only to flags you don't pass, so every one is overridable.
 | `--out-every` | float | `0.25` (cavity), `0.5` (windtunnel) | Interval (sim time) between saved field snapshots (frames). |
 | `--threads` | integer | `0` | Worker threads. `0` = all logical cores. Results are identical regardless of value. |
 | `--solver` | `auto` \| `fft` \| `sor` | `auto` | Poisson solver. `auto` picks `fft` when `n−1` is a power of two, else `sor`. |
+| `--relax` | float `(0,2)` | auto-optimal | SOR over-relaxation factor ω (only affects the `sor` solver). Default is the grid-optimal ω; `1.0` = plain Gauss-Seidel, `>1` over-relax, `<1` under-relax, `≥2` diverges. Convergence uses a residual test, so ω changes the **iteration count / speed**, not the converged solution — watch it in `performance.png`. |
 | `--view` | `none` \| `save` \| `show` | `save` | Visualisation: `save` writes figures; `show` also displays them; `none` skips it. |
 | `--outdir` | path | `output` | Output directory for data (`meta.txt`, `diagnostics.csv`, `fields/`) and figures. |
 
@@ -213,14 +214,18 @@ thread so `--threads 1` matches the serial path.
 ## Output (`output/`)
 - `meta.txt` — run parameters.
 - `diagnostics.csv` — per-step: time, dt, CFL, max speed, kinetic energy,
-  enstrophy, circulation, Poisson iterations, residual.
-- `fields/frame_XXXX.bin` — raw little-endian f64, four `n×n` blocks
-  `[ω | ψ | u | v]`, row-major with index `j*n + i`.
+  enstrophy, circulation, Poisson iterations, residual, per-step wall time
+  (`step_ms`).
+- `fields/frame_XXXX.bin` — raw little-endian f64, four `nx×ny` blocks
+  `[ω | ψ | u | v]`, row-major with index `j*nx + i`.
 
 ## Figures (`output/figures/`)
-- `final_state.png` — vorticity, speed, streamfunction, centerline velocity
-  profiles.
-- `evolution.png` — vorticity snapshots showing the vortex roll-up.
+- `final_state.png` — vorticity, streamlines over speed, streamfunction (+ cavity
+  centerline profiles / wind-tunnel object overlay).
+- `evolution.png` — vorticity snapshots over time.
 - `solver_behavior.png` — energy/enstrophy, adaptive Δt, CFL control, Poisson
   residual (log scale), circulation budget.
+- `performance.png` — solver performance: throughput (steps/s), Poisson
+  iterations/step, wall time/step, cumulative wall time. Use it to compare
+  `--relax` / `--threads` / grid sizes.
 - `vorticity.gif` — animation of the vorticity field.
